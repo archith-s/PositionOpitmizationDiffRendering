@@ -31,11 +31,11 @@ from pytorch3d.renderer import (
 # ─────────────────────────────────────────────
 # CONFIG — edit these paths to match your setup
 # ─────────────────────────────────────────────
-DATASET_ROOT   = "./SIMPLELND_dataset"
+DATASET_ROOT   = "../SIMPLELND_dataset"
 CAMERA_DIR     = os.path.join(DATASET_ROOT, "camera_0", "000001")
 SCENE_CAM_JSON = os.path.join(CAMERA_DIR, "scene_camera.json")
 RGB_DIR        = os.path.join(CAMERA_DIR, "rgb")
-MESH_PATH      = "../surgical_robotics_challenge/ADF/PSMs/LND_420006/high_res/tool pitch link.OBJ"          # <-- point this to your .obj file
+MESH_PATH      = "../../surgical_robotics_challenge/ADF/PSMs/LND_420006/high_res/tool pitch link.OBJ"          # <-- point this to your .obj file
 OUTPUT_GIF     = "./camera0_optimization.gif"
 NUM_ITERS      = 200
 LR             = 0.05

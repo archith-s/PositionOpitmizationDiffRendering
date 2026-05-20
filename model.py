@@ -35,7 +35,7 @@ else:
     device = torch.device("cpu")
 
 # Load the obj and ignore the textures and materials.
-verts, faces_idx, _ = load_obj("./data/teapot.obj")
+verts, faces_idx, _ = load_obj("../data/teapot.obj")
 faces = faces_idx.verts_idx
 
 # Initialize each vertex to be white in color.
