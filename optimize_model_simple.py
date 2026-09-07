@@ -93,17 +93,19 @@ ref_np = np.array(ref_pil_resized).astype(np.float32) / 255.0
 
 
 # ── Build PyTorch3D camera from intrinsics ─────
-# Convert OpenCV K to PyTorch3D NDC focal / principal point.
-# PyTorch3D PerspectiveCameras expect focal_length and principal_point
-# in NDC space where image goes from -1 to 1.
-# focal_ndc  = 2 * f / image_size
-# pp_ndc     = (image_size/2 - c) / (image_size/2)   [x then y, note sign]
-fx_ndc = 2.0 * fx / img_W
-fy_ndc = 2.0 * fy / img_H
-px_ndc = (img_W / 2.0 - cx) / (img_W / 2.0)
-py_ndc = (img_H / 2.0 - cy) / (img_H / 2.0)
+# Screen-space (in_ndc=False) camera with an explicit image_size, NOT
+# PyTorch3D's default NDC convention -- NDC silently mishandles non-square
+# aspect ratios, which produced a confirmed, measured pixel offset against a
+# manual-rasterizer render of identical pose data (see sim_iter_images.py,
+# fixed 2026-07-10). The renderer works at RENDER_SIZE (square), not the
+# native capture resolution, so the intrinsics are rescaled accordingly.
+fx_r = fx * (RENDER_SIZE / img_W)
+fy_r = fy * (RENDER_SIZE / img_H)
+cx_r = cx * (RENDER_SIZE / img_W)
+cy_r = cy * (RENDER_SIZE / img_H)
 
-print(f"NDC focal: ({fx_ndc:.4f}, {fy_ndc:.4f})  principal: ({px_ndc:.4f}, {py_ndc:.4f})")
+print(f"Rescaled intrinsics @ {RENDER_SIZE}x{RENDER_SIZE}: "
+      f"focal=({fx_r:.4f}, {fy_r:.4f})  principal=({cx_r:.4f}, {cy_r:.4f})")
 
 
 # ── Load mesh ──────────────────────────────────
@@ -148,10 +150,12 @@ def make_cameras(R=None, T=None):
     if T is None:
         T = torch.zeros(1, 3, device=device)            # (1, 3) no translation
     return PerspectiveCameras(
-        focal_length=((fx_ndc, fy_ndc),),
-        principal_point=((px_ndc, py_ndc),),
+        focal_length=((fx_r, fy_r),),
+        principal_point=((cx_r, cy_r),),
         R=R,
         T=T,
+        in_ndc=False,
+        image_size=((RENDER_SIZE, RENDER_SIZE),),
         device=device,
     )
 

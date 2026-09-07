@@ -1,14 +1,37 @@
 """
-pose_estimation_dr.py  (multi-view + visualization)
+optimize_model_inter_over_union.py  (multi-view + IoU metric)
 Differentiable-rendering 6-DoF pose estimator (PyTorch3D silhouette loss).
+Identical optimizer to optimize_modelv2.py (same three-stage schedule):
 
-Three-stage optimisation:
   Stage 1    – translation only; centroid+area loss summed over all 3 cameras
                (multi-view centroid gives ~3× stronger translation gradients).
   Stage 2a   – joint R+T; MSE+IoU with sigma=0.025 across all 3 cameras
                (10 px blur radius bridges the ~9–15 px gap left by Stage 1).
   Stage 2b   – joint R+T; MSE+IoU with sigma=0.005 across all 3 cameras
                (3 px precision for final shape matching).
+
+Differences from optimize_modelv2.py:
+  - Visualization draws only two things on top of the RGB frame: the pose axes
+    and a flat-shaded silhouette fill (no other overlay elements).
+  - The silhouette used for both visualization and metrics is a hard binary
+    rasterization (blur_radius=0, faces_per_pixel=1) at full image resolution,
+    not the soft differentiable shader — soft alpha still shows a ~15-50%
+    halo around the true edge even at sigma=1e-4, which this avoids.
+  - A new CSV metric is added: intersection-over-union (IoU) of the crisp
+    binary silhouette, computed GT-vs-GT (sanity check, always 1.0) and
+    GT-vs-estimate (the real metric).
+
+Per-stage iteration counts were cut to ~1/3 of the original budget (1050 ->
+340 total) -- the staging *structure* (translation locked down before
+rotation gets a much lower, decaying LR; sigma annealed coarse-to-fine; IoU
+loss only added once roughly aligned) is what stabilizes convergence, not
+raw iteration count, so this keeps most of the benefit at a fraction of the
+runtime. Symmetry-aware metrics (rotation_error_sym_deg, ADD_S_mm) were also
+added -- this mesh has near-exact 180 degree rotational symmetry about its
+local X axis (verified via KD-tree residual check, same as run_demo_iou.py's
+SYMMETRY_TFS), so a rotation error measured only against the single
+canonical R_gt over-penalizes convergence to this physically indistinguishable
+twin.
 """
 
 import os, re, csv, json, tempfile
@@ -36,8 +59,8 @@ def save_tensor_as_png(tensor: torch.Tensor, path: str):
 
 # ─────────────────────────── CONFIG ───────────────────────────────────────────
 DATASET_ROOT   = "../SIMPLELND_data"
-PRIMARY_CAMERA = "camera_l"
-CAMERA_NAMES   = ["camera_l"]
+PRIMARY_CAMERA = "camera_1"
+CAMERA_NAMES   = ["camera_1"]
 CAMERA_DIRS    = {cam: os.path.join(DATASET_ROOT, cam, "000001") for cam in CAMERA_NAMES}
 
 CAMERA_DIR     = CAMERA_DIRS[PRIMARY_CAMERA]
@@ -47,31 +70,31 @@ RGB_DIR        = os.path.join(CAMERA_DIR, "rgb")
 
 MESH_PATH   = ("../surgical_robotics_challenge/ADF/PSMs/"
                "LND_420006/high_res/tool pitch link.OBJ")
-OUTPUT_CSV  = "../Diff_Render_CSV_Visuals/pose_estimation_results.csv"
-VIZ_DIR     = "../Diff_Render_CSV_Visuals"
+OUTPUT_CSV  = "../IoU_CSV_Visuals_Diff_Render/pose_estimation_results_iou.csv"
+VIZ_DIR     = "../IoU_CSV_Visuals_Diff_Render"
 
 # Stage 1: translation only (single-view centroid+area)
-NUM_ITERS_TRANS    = 200
+NUM_ITERS_TRANS    = 60    # was 200 -- centroid convergence is fast
 LR_TRANS           = 0.05
 
 # Stage 1.5: translation-only silhouette MSE — refines depth before rotation starts
-NUM_ITERS_TRANS_S1B = 300
+NUM_ITERS_TRANS_S1B = 90   # was 300
 LR_TRANS_S1B        = 0.05
 SIGMA_STAGE1B       = 0.025  # same sigma as Stage 2a (cleaner gradient than 0.05)
 
 # Stage 2a: coarse rotation — MSE only, no IoU
-NUM_ITERS_COARSE  = 200
+NUM_ITERS_COARSE  = 70     # was 200
 LR_ROT_COARSE     = 0.003
 SIGMA_STAGE2A     = 0.025
 
 # Stage 2b: intermediate sigma — MSE + light IoU bridges 0.025→0.005 gap
-NUM_ITERS_MID     = 150
+NUM_ITERS_MID     = 50     # was 150
 LR_ROT_MID        = 0.002
 SIGMA_STAGE2B     = 0.010
 IOU_WEIGHT_MID    = 10.0
 
 # Stage 2c: fine rotation — MSE + IoU, tight sigma
-NUM_ITERS_JOINT   = 200
+NUM_ITERS_JOINT   = 70     # was 200
 LR_ROT            = 0.001
 SIGMA_STAGE2      = 0.005
 
@@ -89,6 +112,13 @@ USE_GT_INIT_ONLY       = False
 TARGET_OBJ_IDS        = {1, 3}
 USE_RENDERED_REFERENCE = True
 DEBUG_DIR              = "../debug_renders"
+
+IOU_THRESHOLD   = 0.5
+
+# Visualization-only: clip the silhouette fill to pixels that photometrically
+# look like the tool (low saturation) so occluding tissue isn't painted over.
+# Does not affect the CSV's IoU metric, which stays purely geometric.
+APPEARANCE_SAT_THRESHOLD = 0.25
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -173,6 +203,18 @@ if _vmax < 1.0:
     verts = verts * 1000.0; verts_np = verts_np * 1000.0
 else:
     print("  Vertices in mm.")
+
+# This mesh has near-exact 180° rotational symmetry about its local X axis
+# (verified via KD-tree residual check: 0.10mm mean on a 14.35mm object --
+# same finding run_demo_iou.py's SYMMETRY_TFS is built from). A rotation
+# error measured only against the single canonical R_gt over-penalizes
+# convergence to this physically indistinguishable twin.
+_mesh_center = (verts_np.min(axis=0) + verts_np.max(axis=0)) / 2
+_Rx180 = np.diag([1.0, -1.0, -1.0])
+_Sx180 = np.eye(4)
+_Sx180[:3, :3] = _Rx180
+_Sx180[:3,  3] = _mesh_center - _Rx180 @ _mesh_center
+SYMMETRY_TFS = [np.eye(4), _Sx180]
 
 
 # ── Per-object mean GT translation ────────────────────────────────────────────
@@ -259,7 +301,7 @@ def _compute_extrinsics(src, tgt, ref_fkey="0", ref_obj_id=1):
 _I3 = torch.eye(3,  dtype=torch.float32, device=device)
 _Z3 = torch.zeros(3, dtype=torch.float32, device=device)
 cam_extrinsics: dict[str, tuple] = {
-    "camera_l": (_I3, _Z3),
+    "camera_1": (_I3, _Z3),
 }
 
 
@@ -373,28 +415,78 @@ def add_metric(verts_np, R_est, t_est, R_gt, t_gt):
     return float(np.mean(np.linalg.norm(
         ((R_est @ verts_np.T).T + t_est) - ((R_gt @ verts_np.T).T + t_gt), axis=1)))
 
+def rotation_error_sym_deg(R_est, R_gt, symmetry_tfs):
+    """Minimum geodesic rotation error over all symmetry-equivalent poses."""
+    return float(min(rotation_error_deg(R_est @ S[:3, :3], R_gt) for S in symmetry_tfs))
 
-# ── Visualization renderer (created once at full resolution) ──────────────────
-_ck   = scene_cam[str(valid_frame_ids[0])]["cam_K"]
-_viz_renderer = make_silhouette_renderer(_ck[0], _ck[4], _ck[2], _ck[5],
-                                         img_H, img_W, sigma=0.005)
+def add_s_metric(verts_np, R_est, t_est, R_gt, t_gt, symmetry_tfs):
+    """ADD-S: minimum ADD over all symmetry-equivalent poses."""
+    pts_gt = (R_gt @ verts_np.T).T + t_gt
+    best = float("inf")
+    for S in symmetry_tfs:
+        R_s = R_est @ S[:3, :3]
+        t_s = R_est @ S[:3, 3] + t_est
+        pts_est = (R_s @ verts_np.T).T + t_s
+        best = min(best, float(np.mean(np.linalg.norm(pts_est - pts_gt, axis=1))))
+    return best
+
+def iou_metric(alpha_a: np.ndarray, alpha_b: np.ndarray, threshold=IOU_THRESHOLD) -> float:
+    """Binary IoU between two crisp silhouette alpha masks."""
+    mask_a = alpha_a > threshold
+    mask_b = alpha_b > threshold
+    union  = np.logical_or(mask_a, mask_b).sum()
+    if union == 0:
+        return 1.0
+    inter = np.logical_and(mask_a, mask_b).sum()
+    return float(inter) / float(union)
 
 
-def draw_pose_overlay(rgb_pil, R_bop, t_bop, cam_K, mesh,
-                      color_sil=(0, 220, 0)) -> Image.Image:
-    W, H = rgb_pil.size
+# ── Crisp silhouette + visualization (created once at full resolution) ────────
+# Hard (non-differentiable) rasterization — no soft shader — so the silhouette
+# edge is exact instead of carrying the soft shader's blur halo.
+_crisp_raster_settings = RasterizationSettings(
+    image_size=(img_H, img_W), blur_radius=0.0, faces_per_pixel=1, bin_size=0,
+)
+
+
+def render_crisp_alpha(R_bop, t_bop, cam_K, mesh) -> np.ndarray:
+    """Hard binary silhouette at full image resolution, tightly covering the
+    tool — used for both the visualization fill and IoU."""
     R_pt3d, T_pt3d = bop_to_pt3d(np.array(R_bop), np.array(t_bop))
     R_t = torch.tensor(R_pt3d, dtype=torch.float32, device=device).unsqueeze(0)
     T_t = torch.tensor(T_pt3d, dtype=torch.float32, device=device).unsqueeze(0)
-    cam = make_cameras(R_t, T_t, cam_K[0], cam_K[4], cam_K[2], cam_K[5], H, W)
+    cam = make_cameras(R_t, T_t, cam_K[0], cam_K[4], cam_K[2], cam_K[5], img_H, img_W)
+    rasterizer = MeshRasterizer(cameras=cam, raster_settings=_crisp_raster_settings)
     with torch.no_grad():
-        alpha = np.from_dlpack(
-            _viz_renderer(meshes_world=mesh.clone(), cameras=cam)[0, ..., 3].detach().cpu())
+        frags = rasterizer(mesh.clone(), cameras=cam)
+        mask  = (frags.pix_to_face[0, ..., 0] >= 0).float()
+    return np.from_dlpack(mask.detach().cpu())
 
-    overlay = np.zeros((*alpha.shape, 3), dtype=np.float32)
+
+def appearance_foreground_mask(rgb_pil, sat_threshold=APPEARANCE_SAT_THRESHOLD) -> np.ndarray:
+    """Photometric tool-vs-tissue mask from the real image alone: low
+    saturation (grayish) = metal tool, high saturation (pink/red) = tissue.
+    No 3D scene model needed, so it applies the same way to real data."""
+    rgb = np.array(rgb_pil, dtype=np.float32)
+    mx  = rgb.max(axis=-1)
+    mn  = rgb.min(axis=-1)
+    sat = (mx - mn) / np.clip(mx, 1.0, None)
+    return (sat < sat_threshold).astype(np.float32)
+
+
+def draw_axes_and_silhouette(rgb_pil, alpha, R_bop, t_bop, cam_K,
+                             color_sil=(0, 220, 0), appearance_mask=None) -> Image.Image:
+    """Draws exactly two things on top of the RGB frame: a flat-shaded
+    silhouette fill and the 3-axis pose gizmo. If appearance_mask is given,
+    the fill is clipped to it so the render never spills onto pixels that
+    don't actually look like the tool (e.g. tissue occluding part of the
+    tracked mesh) — this substitutes for true 3D depth compositing, which
+    isn't possible without a tissue mesh (and never will be on real data)."""
+    fill = alpha if appearance_mask is None else alpha * appearance_mask
+    overlay = np.zeros((*fill.shape, 3), dtype=np.float32)
     overlay[..., 0], overlay[..., 1], overlay[..., 2] = color_sil
     rgb_arr = np.array(rgb_pil, dtype=np.float32)
-    blended = np.clip(0.5 * alpha[..., None] * overlay + rgb_arr, 0, 255).astype(np.uint8)
+    blended = np.clip(0.5 * fill[..., None] * overlay + rgb_arr, 0, 255).astype(np.uint8)
     result  = Image.fromarray(blended)
 
     draw = ImageDraw.Draw(result)
@@ -424,6 +516,7 @@ for frame_id in valid_frame_ids:
     rgb_orig_pil = Image.open(rgb_path).convert("RGB")
     ref_np       = np.array(rgb_orig_pil.resize((RENDER_SIZE, RENDER_SIZE), Image.BILINEAR),
                              dtype=np.float32)
+    appearance_mask = appearance_foreground_mask(rgb_orig_pil)
 
     print(f"\n══ Frame {frame_id:04d} ({_rgb_on_disk[frame_id]}) ══")
 
@@ -594,21 +687,34 @@ for frame_id in valid_frame_ids:
             R_est_np, T_est_np = pt3d_to_bop(R_est_pt3d_np, T_est_pt3d_np)
 
         # ── Errors ────────────────────────────────────────────────────────────
-        rot_err   = rotation_error_deg(R_est_np, R_gt)
-        trans_err = translation_error_mm(T_est_np, t_gt)
-        add_val   = add_metric(verts_np, R_est_np, T_est_np, R_gt, t_gt)
-        print(f"    rot={rot_err:.2f}°  trans={trans_err:.2f}mm  ADD={add_val:.2f}mm")
+        rot_err     = rotation_error_deg(R_est_np, R_gt)
+        rot_err_sym = rotation_error_sym_deg(R_est_np, R_gt, SYMMETRY_TFS)
+        trans_err   = translation_error_mm(T_est_np, t_gt)
+        add_val     = add_metric(verts_np, R_est_np, T_est_np, R_gt, t_gt)
+        add_s_val   = add_s_metric(verts_np, R_est_np, T_est_np, R_gt, t_gt, SYMMETRY_TFS)
 
-        # ── Visualization ─────────────────────────────────────────────────────
+        # ── IoU (crisp binary silhouette, full resolution) ──────────────────────
+        alpha_gt  = render_crisp_alpha(R_gt,     t_gt,     cam_K, mesh)
+        alpha_est = render_crisp_alpha(R_est_np, T_est_np, cam_K, mesh)
+        iou_gt_vs_gt  = iou_metric(alpha_gt, alpha_gt)
+        iou_gt_vs_est = iou_metric(alpha_gt, alpha_est)
+        print(f"    rot={rot_err:.2f}° (sym={rot_err_sym:.2f}°)  trans={trans_err:.2f}mm  "
+              f"ADD={add_val:.2f}mm (ADD-S={add_s_val:.2f}mm)  "
+              f"IoU(gt,gt)={iou_gt_vs_gt:.4f}  IoU(gt,est)={iou_gt_vs_est:.4f}")
+
+        # ── Visualization: only axes + silhouette fill on the RGB frame ────────
         try:
-            gt_ov  = draw_pose_overlay(rgb_orig_pil, R_gt,     t_gt,     cam_K, mesh, (0, 220, 0))
-            est_ov = draw_pose_overlay(rgb_orig_pil, R_est_np, T_est_np, cam_K, mesh, (220, 80, 0))
+            gt_ov  = draw_axes_and_silhouette(rgb_orig_pil, alpha_gt,  R_gt,     t_gt,     cam_K, (0, 220, 0),
+                                              appearance_mask=appearance_mask)
+            est_ov = draw_axes_and_silhouette(rgb_orig_pil, alpha_est, R_est_np, T_est_np, cam_K, (220, 80, 0),
+                                              appearance_mask=appearance_mask)
             LH = 28
             combined = Image.new("RGB", (img_W * 2, img_H + LH), (40, 40, 40))
             combined.paste(gt_ov,  (0,     LH));  combined.paste(est_ov, (img_W, LH))
             d = ImageDraw.Draw(combined)
             d.text((8,         5), f"GT  frame={frame_id:04d}  obj={obj_id}", fill=(100,255,100))
-            d.text((img_W + 8, 5), f"EST  rot={rot_err:.1f}°  trans={trans_err:.1f}mm  ADD={add_val:.1f}mm",
+            d.text((img_W + 8, 5), f"EST  rot={rot_err:.1f}° (sym={rot_err_sym:.1f}°)  trans={trans_err:.1f}mm  "
+                                    f"ADD={add_val:.1f}mm (ADD-S={add_s_val:.1f}mm)  IoU={iou_gt_vs_est:.3f}",
                    fill=(255,180,80))
             out = os.path.join(VIZ_DIR, f"viz_frame{frame_id:04d}_obj{obj_id}.png")
             combined.save(out);  print(f"    viz → {out}")
@@ -627,9 +733,13 @@ for frame_id in valid_frame_ids:
             "gt_tx_mm": t_gt[0],  "gt_ty_mm": t_gt[1],  "gt_tz_mm": t_gt[2],
             "init_rotation_error_deg":   init_rot_err,
             "init_translation_error_mm": init_trans_err,
-            "rotation_error_deg":   rot_err,
-            "translation_error_mm": trans_err,
-            "ADD_mm":               add_val,
+            "rotation_error_deg":     rot_err,
+            "rotation_error_sym_deg": rot_err_sym,
+            "translation_error_mm":   trans_err,
+            "ADD_mm":                 add_val,
+            "ADD_S_mm":               add_s_val,
+            "iou_gt_vs_gt":           iou_gt_vs_gt,
+            "iou_gt_vs_est":          iou_gt_vs_est,
         })
 
 
@@ -641,12 +751,18 @@ if csv_rows:
     print(f"\nCSV → {OUTPUT_CSV}  ({len(csv_rows)} rows)")
 
 if csv_rows:
-    re_ = [r["rotation_error_deg"]   for r in csv_rows]
-    te_ = [r["translation_error_mm"] for r in csv_rows]
-    ae_ = [r["ADD_mm"]              for r in csv_rows]
+    re_     = [r["rotation_error_deg"]     for r in csv_rows]
+    re_sym_ = [r["rotation_error_sym_deg"] for r in csv_rows]
+    te_     = [r["translation_error_mm"]   for r in csv_rows]
+    ae_     = [r["ADD_mm"]                 for r in csv_rows]
+    ae_s_   = [r["ADD_S_mm"]               for r in csv_rows]
+    iou_    = [r["iou_gt_vs_est"]          for r in csv_rows]
     print("\n── Summary ─────────────────────────────────────────────")
-    print(f"  Rows             : {len(csv_rows)}")
-    print(f"  Mean rotation    : {np.mean(re_):.4f}°  (std {np.std(re_):.4f})")
-    print(f"  Mean translation : {np.mean(te_):.4f} mm (std {np.std(te_):.4f})")
-    print(f"  Mean ADD         : {np.mean(ae_):.4f} mm (std {np.std(ae_):.4f})")
+    print(f"  Rows                 : {len(csv_rows)}")
+    print(f"  Mean rotation        : {np.mean(re_):.4f}°  (std {np.std(re_):.4f})")
+    print(f"  Mean rotation (sym)  : {np.mean(re_sym_):.4f}°  (std {np.std(re_sym_):.4f})")
+    print(f"  Mean translation     : {np.mean(te_):.4f} mm (std {np.std(te_):.4f})")
+    print(f"  Mean ADD             : {np.mean(ae_):.4f} mm (std {np.std(ae_):.4f})")
+    print(f"  Mean ADD-S           : {np.mean(ae_s_):.4f} mm (std {np.std(ae_s_):.4f})")
+    print(f"  Mean IoU(gt,est)     : {np.mean(iou_):.4f}  (std {np.std(iou_):.4f})")
     print("────────────────────────────────────────────────────────")
