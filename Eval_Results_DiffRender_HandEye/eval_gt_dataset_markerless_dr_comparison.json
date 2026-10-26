@@ -1,5 +1,5 @@
 {
-  "generated": "2026-10-26T18:32:22",
+  "generated": "2026-10-26T18:43:50",
   "dataset": "/home/aseshad4/hand_eye_collection_scripts/gt_dataset",
   "dr_inputs": [
     "right_rect + left_rect images",
@@ -48,6 +48,7 @@
     11
   ],
   "mask_passes": 4,
+  "fit_runtime_s": null,
   "cam_T_base_ground_truth": [
     [
       0.4542763439243451,
@@ -157,7 +158,7 @@
     "rotation_err_deg": 17.569883877679118
   },
   "overall": {
-    "marker only": {
+    "hand-eye (marker only)": {
       "mean_clevis_displacement_mm": 19.130508985579016,
       "rotation_err_deg": 1.5253374516500127e-14,
       "base_origin_err_mm": 19.130509714577293,
@@ -184,7 +185,7 @@
         1332,
         890
       ],
-      "marker only": {
+      "hand-eye (marker only)": {
         "trans_err_mm": 19.130508985579016,
         "rot_err_deg": 1.1323670272593892e-13,
         "iou_vs_gt": 0.0560688826902216,
@@ -206,7 +207,7 @@
         1455,
         875
       ],
-      "marker only": {
+      "hand-eye (marker only)": {
         "trans_err_mm": 19.13050898557901,
         "rot_err_deg": 1.1885256204943237e-14,
         "iou_vs_gt": 0.0,
@@ -228,7 +229,7 @@
         1424,
         718
       ],
-      "marker only": {
+      "hand-eye (marker only)": {
         "trans_err_mm": 19.130508985579027,
         "rot_err_deg": 2.897879797295002e-14,
         "iou_vs_gt": 0.0023806177307705823,
@@ -250,7 +251,7 @@
         993,
         667
       ],
-      "marker only": {
+      "hand-eye (marker only)": {
         "trans_err_mm": 19.130508985579024,
         "rot_err_deg": 4.348999366721219e-14,
         "iou_vs_gt": 0.008063870123628207,
@@ -272,7 +273,7 @@
         1008,
         662
       ],
-      "marker only": {
+      "hand-eye (marker only)": {
         "trans_err_mm": 19.13050898557901,
         "rot_err_deg": 1.176848213711723e-14,
         "iou_vs_gt": 3.387648633083776e-05,
@@ -285,5 +286,6 @@
         "add_mm": 4.568214452048125
       }
     }
-  ]
+  ],
+  "generated_fit": "2026-10-26T18:43:27"
 }
