@@ -45,13 +45,14 @@ Pipeline:
      IoU of the two silhouettes -- plus the IoU of each against the image mask.
 
 OUTPUT: <eval-dir>/eval_<dataset>_markerless_dr_comparison.pdf + .json, and
-<root>/hand_eye_diff_render_comparison/ (boxes, masks, overlays).
+<root>/hand_eye_diff_render_comparison/ (boxes, masks, overlays). --reuse-fit rebuilds the
+report from the previous run's diff-render result without refitting (fits are non-deterministic).
 
 Run from PoseOptimizerCode/ with the diff_render env (FoundationPose/miniconda3/envs/diff_render)
 or foundationpose; both have PyTorch3D + CUDA.
 """
 
-import os, re, json, math, time, struct, hashlib, tempfile, datetime
+import os, re, json, math, time, struct, hashlib, tempfile, textwrap, datetime
 import argparse
 import numpy as np
 import cv2
@@ -1089,54 +1090,120 @@ print("\n" + "\n".join(lines))
 
 
 # ── Overlays + PDF + JSON ─────────────────────────────────────────────────────
-def panel(i, Xc, col):
-    """Image crop with the clevis contour at Xc (method colour) and at the ground truth (orange)."""
-    o = images[i].copy()
-    rects = []
-    for Xd, c in ((X_gt, GT_COL), (Xc, col)):
-        r = render_mask(Xd, i).astype(np.uint8)
-        cnts, _ = cv2.findContours(r, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        cv2.drawContours(o, cnts, -1, c, 3)
-        if cnts:
-            rects.append(cv2.boundingRect(np.concatenate(cnts)))
-    if rects:
-        x0 = min(b[0] for b in rects); y0 = min(b[1] for b in rects)
-        x1 = max(b[0] + b[2] for b in rects); y1 = max(b[1] + b[3] for b in rects)
-        m = int(0.35 * max(x1 - x0, y1 - y0)) + 30
-        o = o[max(0, y0 - m):min(img_H, y1 + m), max(0, x0 - m):min(img_W, x1 + m)]
-    return cv2.cvtColor(o, cv2.COLOR_BGR2RGB)
+# Per-frame figures follow hand_eye_diff_render_test.py's make_side_by_side: full frame, filled silhouette
+# (ground truth green, calibration under test orange) plus the clevis axes, label bar on top.
+_LABEL_FONT = ImageFont.load_default(size=34)
 
 
-for i in ALL:
-    fid = frames[i]["frame_id"]
-    cv2.imwrite(os.path.join(OUT_DIR, "masks", f"mask-{fid:04d}.png"), masks[i] * 255)
-    o = images[i].copy()
-    if boxes[i] is not None:
-        cv2.rectangle(o, tuple(boxes[i][:2]), tuple(boxes[i][2:]), (0, 0, 255), 3)
-    cv2.imwrite(os.path.join(OUT_DIR, "overlays", f"box-{fid:04d}.jpg"), o)
-with open(os.path.join(OUT_DIR, "stereo_boxes.json"), "w") as fh:
-    json.dump({str(frames[i]["frame_id"]): boxes[i] for i in ALL}, fh)
+def draw_axes_and_silhouette(rgb_pil, alpha, T, K3, color_sil) -> Image.Image:
+    overlay = np.zeros((*alpha.shape, 3), dtype=np.float32)
+    overlay[..., 0], overlay[..., 1], overlay[..., 2] = color_sil
+    blended = np.clip(0.5 * alpha[..., None] * overlay + np.array(rgb_pil, dtype=np.float32), 0, 255).astype(np.uint8)
+    result = Image.fromarray(blended)
+    draw = ImageDraw.Draw(result)
 
-stem = f"eval_{DATASET}_markerless_dr_comparison"
-pdf_path = os.path.join(args.eval_dir, stem + ".pdf")
+    def proj(p):
+        pc = T[:3, :3] @ np.array(p, dtype=np.float64) + T[:3, 3]
+        return (int(round(K3[0, 0] * pc[0] / pc[2] + K3[0, 2])), int(round(K3[1, 1] * pc[1] / pc[2] + K3[1, 2]))) \
+            if pc[2] > 0 else None
+    cen = proj([0, 0, 0])
+    # X->blue, Y->green, Z->red, as hand_eye_diff_render_test.py (image_generation_gt_hand_eye.py's convention)
+    for end, col in zip([proj([15.0, 0, 0]), proj([0, 15.0, 0]), proj([0, 0, 15.0])],
+                        [(50, 50, 220), (50, 220, 50), (220, 50, 50)]):
+        if cen and end:
+            draw.line([cen, end], fill=col, width=4)
+    return result
+
+
+def make_side_by_side(i, X_est, left_label, right_label) -> np.ndarray:
+    rgb = Image.fromarray(cv2.cvtColor(images[i], cv2.COLOR_BGR2RGB))
+    T_gt, T_est = frame_poses_np(X_gt, frames[i])[0], frame_poses_np(X_est, frames[i])[0]
+    img_gt = draw_axes_and_silhouette(rgb, render_mask(X_gt, i).astype(np.float32), T_gt, frames[i]["K3"], (0, 220, 0))
+    img_est = draw_axes_and_silhouette(rgb, render_mask(X_est, i).astype(np.float32), T_est, frames[i]["K3"], (220, 80, 0))
+    LH = 48
+    combined = Image.new("RGB", (img_W * 2, img_H + LH), (40, 40, 40))
+    combined.paste(img_gt, (0, LH))
+    combined.paste(img_est, (img_W, LH))
+    d = ImageDraw.Draw(combined)
+    d.text((12, 6), left_label, fill=(100, 255, 100), font=_LABEL_FONT)
+    d.text((img_W + 12, 6), right_label, fill=(255, 180, 80), font=_LABEL_FONT)
+    return np.array(combined)
+
+
+def metrics_table_page(pdf):
+    fig = plt.figure(figsize=(11, 8.5))
+    fig.suptitle(f"{DATASET}: hand-eye (marker only) vs diff-render (markerless), both scored against the ground truth "
+                 f"(marker + 3D pose alignment)", fontsize=11, y=0.96)
+
+    ax = fig.add_axes([0.04, 0.50, 0.92, 0.38]); ax.axis("off")
+    ax.set_title(f"First {len(rows)} frames", fontsize=10, loc="left")
+    cols = ["Frame"] + [f"{n.split(' (')[0]}\n{m}" for n, _ in METHODS
+                        for m in ("trans. err (mm)", "rot. err (deg)", "IoU")]
+    cells = [[f"{row['frame_id']}{'' if row['inlier'] else ' *'}"] +
+             [f"{row[n][k]:.{p}f}" for n, _ in METHODS
+              for k, p in (("trans_err_mm", 2), ("rot_err_deg", 2), ("iou_vs_gt", 3))] for row in rows]
+    cells.append(["Mean"] + [f"{overall[n][k]:.{p}f}" for n, _ in METHODS
+                             for k, p in (("eval_mean_trans_err_mm", 2), ("eval_mean_rot_err_deg", 2),
+                                          ("eval_mean_iou_vs_gt", 3))])
+    tab = ax.table(cellText=cells, colLabels=cols, loc="upper center", cellLoc="center")
+    tab.auto_set_font_size(False); tab.set_fontsize(9); tab.scale(1, 1.9)
+    for c in range(len(cols)):
+        tab[0, c].set_facecolor("#e8e8e8"); tab[0, c].set_text_props(weight="bold")
+        tab[len(cells), c].set_text_props(weight="bold")
+    for c in range(1, 4):
+        tab[0, c].set_facecolor("#f6e3d2")        # hand-eye columns
+    for c in range(4, 7):
+        tab[0, c].set_facecolor("#d9efd9")        # diff-render columns
+
+    ax2 = fig.add_axes([0.14, 0.24, 0.72, 0.22]); ax2.axis("off")
+    ax2.set_title(f"Whole calibration, all {N} frames", fontsize=10, loc="left")
+    cal = [["PnP init (no prior)", f"{d0:.2f}", f"{r0:.2f}", f"{np.linalg.norm(X_init[:3, 3] - X_gt[:3, 3]):.2f}"]]
+    cal += [[n, f"{overall[n]['mean_clevis_displacement_mm']:.2f}", f"{overall[n]['rotation_err_deg']:.2f}",
+             f"{overall[n]['base_origin_err_mm']:.2f}"] for n, _ in METHODS]
+    tab2 = ax2.table(cellText=cal, colLabels=["Calibration", "mean clevis\ndisplacement (mm)", "rotation\nerr (deg)",
+                                             "base-origin\nerr (mm)"], loc="upper center", cellLoc="center")
+    tab2.auto_set_font_size(False); tab2.set_fontsize(9); tab2.scale(1, 1.9)
+    for c in range(4):
+        tab2[0, c].set_facecolor("#e8e8e8"); tab2[0, c].set_text_props(weight="bold")
+
+    fig.text(0.04, 0.05, textwrap.fill(
+        "trans. err = distance between the clevis origin (pitch pin) under the calibration and under the ground truth; "
+        "rot. err = geodesic angle between the two clevis orientations (equal to the calibration's rotation error, so "
+        "the same in every frame); IoU = overlap of the clevis silhouettes rendered at the calibration and at the "
+        "ground truth. * = frame dropped by the diff-render outlier rejection (still scored). Diff-render inputs: "
+        "rectified images, camera/stereo calibration, joint.stl, PSM kinematics -- no ground truth, marker calibration "
+        "or initial pose.", 175), fontsize=7.5, va="bottom")
+    pdf.savefig(fig); plt.close(fig)
+
+
+if masks is not None:
+    for i in ALL:
+        fid = frames[i]["frame_id"]
+        cv2.imwrite(os.path.join(OUT_DIR, "masks", f"mask-{fid:04d}.png"), masks[i] * 255)
+        o = images[i].copy()
+        if boxes[i] is not None:
+            cv2.rectangle(o, tuple(boxes[i][:2]), tuple(boxes[i][2:]), (0, 0, 255), 3)
+        cv2.imwrite(os.path.join(OUT_DIR, "overlays", f"box-{fid:04d}.jpg"), o)
+    with open(os.path.join(OUT_DIR, "stereo_boxes.json"), "w") as fh:
+        json.dump({str(frames[i]["frame_id"]): boxes[i] for i in ALL}, fh)
+
 with PdfPages(pdf_path) as pdf:
+    metrics_table_page(pdf)
     fig = plt.figure(figsize=(11, 8.5))
     fig.text(0.02, 0.98, "\n".join(lines), family="monospace", fontsize=6.6, va="top", ha="left")
     pdf.savefig(fig); plt.close(fig)
     for row in rows:
         i = next(k for k in ALL if frames[k]["frame_id"] == row["frame_id"])
-        fig, axes = plt.subplots(1, 2, figsize=(11, 5.6))
-        for ax, (name, Xc, col) in zip(axes, METHODS):
+        fig, axes = plt.subplots(2, 1, figsize=(11, 8.5))
+        for ax, (name, Xc) in zip(axes, METHODS):
             m = row[name]
-            ax.imshow(panel(i, Xc, col))
-            ax.set_title(f"{name}  vs  ground truth\ntranslation error {m['trans_err_mm']:.2f} mm   "
-                         f"rotation error {m['rot_err_deg']:.2f} deg   IoU {m['iou_vs_gt']:.3f}",
-                         fontsize=9, color=np.array(col[::-1]) / 255 * 0.8)
+            ax.imshow(make_side_by_side(i, Xc, f"GT (marker + 3D alignment)  frame={row['frame_id']}", name))
+            ax.set_title(f"{name}:  translation error {m['trans_err_mm']:.2f} mm   rotation error "
+                         f"{m['rot_err_deg']:.2f} deg   IoU {m['iou_vs_gt']:.3f}", fontsize=10)
             ax.axis("off")
-        fig.suptitle(f"{DATASET} frame {row['frame_id']}: clevis rendered at each calibration (coloured) and at "
-                     f"the ground truth (orange){'' if row['inlier'] else '   [frame not used by the DR fit]'}",
-                     fontsize=10)
-        fig.tight_layout(rect=(0, 0, 1, 0.94))
+        fig.suptitle(f"frame_{row['frame_id']}" + ("" if row["inlier"] else "   (dropped by the diff-render outlier "
+                                                    "rejection; still scored)"), fontsize=11)
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
         pdf.savefig(fig); plt.close(fig)
 
 result = dict(
@@ -1144,13 +1211,14 @@ result = dict(
     dr_inputs=["right_rect + left_rect images", "camera_matrix_right_rect", "rect_T_cam_raw",
                "stereo_rectification P matrices", "joint.stl", "base_T_gripper", "base_T_shaft_end"],
     frames=[f["frame_id"] for f in frames], tip_found=[frames[i]["frame_id"] for i in USE],
-    inliers=[frames[i]["frame_id"] for i in inliers], mask_passes=args.mask_passes,
+    inliers=[frames[i]["frame_id"] for i in inliers], mask_passes=args.mask_passes, fit_runtime_s=fit_runtime,
     cam_T_base_ground_truth=to_m(X_gt).tolist(), cam_T_base_marker_only=to_m(X_marker).tolist(),
     cam_T_base_pnp_init=to_m(X_init).tolist(), cam_T_base_diff_render=to_m(X_dr).tolist(),
     pnp_init_vs_gt=dict(mean_clevis_displacement_mm=d0, rotation_err_deg=r0),
     overall=overall, eval_frames=rows,
 )
-json_path = os.path.join(args.eval_dir, stem + ".json")
+if args.reuse_fit:
+    result["generated_fit"] = prev["generated"]
 with open(json_path, "w") as fh:
     json.dump(result, fh, indent=2)
 print(f"Report → {pdf_path}\nResult → {json_path}")
