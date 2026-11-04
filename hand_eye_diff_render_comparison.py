@@ -28,11 +28,13 @@ Pipeline:
   1. TOOL BOX (stereo, per frame): SGBM disparity with the right image as reference
      (this rig's rectified pair is mirrored relative to OpenCV's left/right convention),
      left-right consistency check, a RANSAC plane for the board (disparity is affine in
-     (x, y) for a plane), "near" = clearly in front of it. The tip is the largest
-     near + metallic (low-saturation, bright) blob not touching the image border (the
-     shaft enters from the border, the tip doesn't); frames whose blob depth disagrees
-     with the other frames re-pick among their candidates.
-  2. MASK: GrabCut initialised with that box.
+     (x, y) for a plane), "near" = clearly in front of it. Near + metallic (low-saturation,
+     bright) blobs are cut to the pixels within TIP_LEN_MM of their tip end -- the point
+     farthest from where the blob meets the image border (the shaft enters from the
+     border, the tip doesn't), or for a blob clear of the border the end of its long axis
+     farther from it -- and the largest is the tip; frames whose tip depth disagrees with
+     the other frames re-pick among their candidates.
+  2. MASK: GrabCut initialised with that box, kept within the near region.
   3. INIT: PnP (RANSAC, SQPnP) of the mask centroids vs the clevis centres from the
      kinematics -- a coarse calibration from images + kinematics alone.
   4. DIFF-RENDER: hand_eye_dr_refine.py's joint fit (one shared 6-DoF correction over
@@ -40,9 +42,27 @@ Pipeline:
      re-seeded with that script's GrabCut at the CURRENT DR estimate (clipped to the
      box), and the jaw/shaft/prong ignore zones always come from the current estimate.
      Low-IoU frames are dropped and the fit redone.
-  5. EVAL (first --eval-frames frames): the clevis rendered at each calibration vs at
-     the ground truth -- translation error (clevis origin, mm), rotation error (deg),
-     IoU of the two silhouettes -- plus the IoU of each against the image mask.
+  5. EVAL on HELD-OUT frames: steps 1-4 see only the first --train-frac of the frames
+     (by frame order, default 75%); the rest are never opened before the calibration is
+     final. On each held-out frame every calibration is applied to that frame's
+     kinematics (rect · cam_raw_T_base · base_T_clevis) and compared with the ground
+     truth applied the same way -- translation error (clevis origin, mm), rotation
+     error (deg), IoU of the two rendered silhouettes. What is scored is the
+     calibration, not a per-frame clevis fit (there is none).
+
+  6. PAGE 1 of the PDF: the LAST TRAINING frame -- diff-render vs ground truth overlay, ADD
+     accuracy-vs-threshold curve, SurgRIPE metrics (evaluate.py's Evaluator, with the frame's own K),
+     and the calibration's run time per image (load + stereo box, masks, equal share of the joint
+     DR steps) and in total. Run times are only measured by a real fit (--reuse-fit reuses them).
+
+  7. MASK BASELINE (after the fit; appended to the PDF): the final-pass masks are compared with a hand
+     segmentation of the clevis using ~/hand_eye_collection_scripts/gt_segmentation_eval.py -- its
+     two-panel window opens for frames not drawn yet (draw on the left, generated mask on the right;
+     masks kept in <root>/hand_segmentation/ for every later run), then its metrics: IoU (whole image and
+     the region the DR loss uses) and rot / trans / in-plane / depth error between the clevis poses best
+     fitting each mask. A --reuse-fit whose masks are not on disk rebuilds them (same steps, seeded from the
+     run's final calibration) and says so. --no-annotate scores existing drawings only;
+     --no-mask-baseline skips it.
 
 OUTPUT: <eval-dir>/eval_<dataset>_markerless_dr_comparison.pdf + .json, and
 <root>/hand_eye_diff_render_comparison/ (boxes, masks, overlays). --reuse-fit rebuilds the
@@ -52,7 +72,8 @@ Run from PoseOptimizerCode/ with the diff_render env (FoundationPose/miniconda3/
 or foundationpose; both have PyTorch3D + CUDA.
 """
 
-import os, re, json, math, time, struct, hashlib, tempfile, textwrap, datetime
+import os, re, io, json, math, time, struct, hashlib, tempfile, textwrap, datetime, contextlib
+_T_SCRIPT0 = time.time()     # one-time start-up (imports, CUDA, mesh, renderer) is reported separately
 import argparse
 import numpy as np
 import cv2
@@ -78,6 +99,8 @@ from pytorch3d.renderer import (
 )
 from pytorch3d.transforms import so3_exp_map
 
+from evaluate import Evaluator, project as sr_project   # SurgRIPE's metric code (its run.py uses the same)
+
 
 # ─────────────────────────── CONFIG ───────────────────────────────────────────
 HAND_EYE_ROOT = "/home/aseshad4/hand_eye_collection_scripts/gt_dataset"
@@ -90,6 +113,8 @@ IMAGE_FIELD   = "right_rect_image"
 LEFT_FIELD    = "left_rect_image"
 K_FIELD       = "camera_matrix_right_rect"
 OUT_SUBDIR    = "hand_eye_diff_render_comparison"
+SEG_PDF_NAME  = "mask_vs_segmentation_eval.pdf"     # standalone report in gt_segmentation_eval.py format
+HAND_SEG_SUBDIR = "hand_segmentation"                 # hand-drawn clevis masks (gt_segmentation_eval.py format)
 # The ONLY per-record fields the calibration may read. cam_T_* / cam_raw_T_* are absent on purpose.
 ALLOWED_FIELDS = ("frame_index", IMAGE_FIELD, LEFT_FIELD, K_FIELD, "rect_T_cam_raw",
                   "base_T_gripper", "base_T_shaft_end")
@@ -135,9 +160,11 @@ JAW_SEED_HALF_WIDTH_MM  = 1.2
 STEREO_SCALE    = 2       # SGBM at half resolution
 MIN_DISP_PX     = 16.0    # full-res; farther than ~0.6 m is outside any endoscope's working range -> mismatch
 NEAR_RATIO      = 1.12    # "in front of the board" = disparity > this x the board plane's
+NEAR_GROW_PX    = 20      # full-res; the box GrabCut mask must lie within the near region grown by this
 METAL_MAX_SAT   = 90
 METAL_MIN_VAL   = 90
 BOX_MARGIN      = 0.2     # of the blob's larger side
+TIP_LEN_MM      = 14.0    # the box covers the blob's pixels within this distance of its tip end (jaws + clevis)
 BOX_CLIP_PX     = 40      # estimate-seeded masks are kept within the box grown by this
 DEPTH_AGREE     = 0.25    # a frame's tip blob may differ from the median tip disparity by this fraction
 
@@ -168,7 +195,9 @@ parser.add_argument("--hand-eye-root", type=str, default=HAND_EYE_ROOT,
 parser.add_argument("--model-root", type=str, default=MODEL_ROOT, help="Directory holding joint.stl + joint.npy")
 parser.add_argument("--eval-dir", type=str, default=EVAL_DIR, help="Where the PDF / JSON go")
 parser.add_argument("--out-dir", type=str, default=None, help=f"Intermediate outputs (default: <root>/{OUT_SUBDIR})")
-parser.add_argument("--eval-frames", type=int, default=5, help="Report the first N frames")
+parser.add_argument("--train-frac", type=float, default=0.75,
+                    help="Fraction of the frames (in frame order) the calibration is fit on; the rest are held out "
+                         "and are the only frames evaluated")
 parser.add_argument("--exclude", type=int, nargs="*", default=[], help="frame_index values to leave out")
 parser.add_argument("--mask-passes", type=int, default=4,
                     help="Fit rounds; round 1 uses the stereo-box masks, later rounds re-seed from the DR estimate")
@@ -176,6 +205,23 @@ parser.add_argument("--batch", type=int, default=BATCH_SIZE)
 parser.add_argument("--reuse-fit", action="store_true",
                     help="Skip the fit: rebuild the report from the previous run's diff-render result (the eval "
                          "JSON) and stereo boxes. Fits are non-deterministic, so this keeps the numbers fixed.")
+parser.add_argument("--no-mask-baseline", action="store_true",
+                    help="Skip the mask baseline (generated masks vs hand-drawn segmentation)")
+parser.add_argument("--no-annotate", action="store_true",
+                    help="Mask baseline: do not open the drawing window; score only frames already hand-segmented")
+parser.add_argument("--seg-tools", type=str, default="~/hand_eye_collection_scripts",
+                    help="Directory holding gt_segmentation_eval.py (annotation window, silhouette fit, metrics)")
+parser.add_argument("--hand-seg-dir", type=str, default=None,
+                    help=f"Hand-drawn masks + segmentation_annotations.json (default: <root>/{HAND_SEG_SUBDIR})")
+parser.add_argument("--seg-fit-restarts", type=int, default=4,
+                    help="Mask baseline pose fit: starts per mask (gt_segmentation_eval.py --fit-restarts)")
+parser.add_argument("--seg-seed", type=int, default=0)
+parser.add_argument("--seg-frames", type=int, default=10,
+                    help="Mask baseline: number of training frames to hand-segment and score, evenly spaced "
+                         "over the frames with a generated mask (0 = all)")
+parser.add_argument("--runtime-from", type=str, default=None,
+                    help="With --reuse-fit, when the reused fit has no run-time log: an eval JSON of another fit "
+                         "(same train frames) whose per-image run times go on page 1, labelled as from that run")
 args = parser.parse_args()
 
 ROOT    = args.hand_eye_root
@@ -273,8 +319,8 @@ for rec in _records:
         B=to_mm(joint_model_pose(np.array(rec["base_T_shaft_end"]), np.array(rec["base_T_gripper"]))),  # base_T_clevis
         G=to_mm(rec["base_T_gripper"]),                                                                    # base_T_gripper
     ))
-if len(frames) < 3:
-    raise SystemExit(f"need at least 3 frames, have {len(frames)}")
+if len(frames) < 4:
+    raise SystemExit(f"need at least 4 frames (3 to fit, 1 held out), have {len(frames)}")
 N = len(frames)
 print(f"Frames: {N}  ({', '.join(str(f['frame_id']) for f in frames)})")
 
@@ -795,6 +841,8 @@ def calib_change(Xa, Xb, sel):
 # right image than in the left (x_right = x_left + d), the mirror of OpenCV's convention, so SGBM is run with
 # the right image as its reference ("left") image. The sign is read from the calibration, not assumed.
 _RIGHT_IS_LEFT = float(np.array(_stereo["right"]["P"])[0, 3]) > 0
+# Baseline (mm) from P[0,3] = -fx·Tx (metres): at disparity d a millimetre spans d / BASELINE_MM pixels.
+BASELINE_MM = 1000.0 * abs(float(np.array(_stereo["right"]["P"])[0, 3])) / float(np.array(_stereo["right"]["P"])[0, 0])
 
 
 def _sgbm():
@@ -824,8 +872,28 @@ def right_disparity(L, R) -> np.ndarray:
     return np.where((d >= MIN_DISP_PX) & consistent, d, 0).astype(np.float32)
 
 
+def tip_end(blob, touches_border):
+    """(x, y) of the blob's tip end. The shaft enters from the image border, so when the blob touches it
+    the tip is the blob pixel farthest from where it does; otherwise it is the end of the blob's long axis
+    farther from the image border."""
+    h, w = blob.shape
+    ys, xs = np.nonzero(blob)
+    if touches_border:
+        edge = (xs <= 2) | (ys <= 2) | (xs >= w - 3) | (ys >= h - 3)
+        k = np.argmax((xs - xs[edge].mean()) ** 2 + (ys - ys[edge].mean()) ** 2)
+        return xs[k], ys[k]
+    pts = np.column_stack([xs, ys]).astype(np.float64)
+    axis = np.linalg.svd(pts - pts.mean(0), full_matrices=False)[2][0]
+    s = (pts - pts.mean(0)) @ axis
+    ends = [pts[np.argmin(s)], pts[np.argmax(s)]]
+    border_dist = [min(x, y, w - 1 - x, h - 1 - y) for x, y in ends]
+    return ends[int(np.argmax(border_dist))]
+
+
 def tip_candidates(L, R):
-    """Near + metallic blobs not touching the border, largest first: (area, median disparity, full-res box)."""
+    """Near + metallic blobs, largest first: (area, median disparity, full-res box), and the full-res map of
+    everything in front of the board. When the tool is close its wrist, ring and shaft form one blob running
+    off the border, so each blob is cut down to its pixels within TIP_LEN_MM of its tip end before boxing."""
     s = STEREO_SCALE
     d = right_disparity(L, R)
     h, w = d.shape
@@ -846,27 +914,45 @@ def tip_candidates(L, R):
     coef = np.linalg.lstsq(A[best], dv[best], rcond=None)[0]
     plane = coef[0] * xx + coef[1] * yy + coef[2]
     hsv = cv2.cvtColor(cv2.resize(R, (w, h), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2HSV)
-    cand = ok & (d > NEAR_RATIO * plane) & (hsv[..., 1] < METAL_MAX_SAT) & (hsv[..., 2] > METAL_MIN_VAL)
+    near = ok & (d > NEAR_RATIO * plane)
+    near_full = cv2.morphologyEx(near.astype(np.uint8), cv2.MORPH_CLOSE,
+                                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+    near_full = cv2.dilate(cv2.resize(near_full, (img_W, img_H), interpolation=cv2.INTER_NEAREST), disk(NEAR_GROW_PX))
+    cand = near & (hsv[..., 1] < METAL_MAX_SAT) & (hsv[..., 2] > METAL_MIN_VAL)
     cand = cv2.morphologyEx(cand.astype(np.uint8), cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
     cand = cv2.morphologyEx(cand, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     n, lab, st, _ = cv2.connectedComponentsWithStats(cand)
     out = []
     for k in range(1, n):
         x, y, bw, bh, area = st[k]
-        if x <= 2 or y <= 2 or x + bw >= w - 2 or y + bh >= h - 2:    # the shaft enters from the border, the tip doesn't
-            continue
-        dk = d[(lab == k) & ok]
+        blob = lab == k
+        dk = d[blob & ok]
         if len(dk) < 20:
             continue
+        touches = x <= 2 or y <= 2 or x + bw >= w - 2 or y + bh >= h - 2
+        tx, ty = tip_end(blob, touches)
+        r = TIP_LEN_MM * float(np.median(dk)) / BASELINE_MM / s    # TIP_LEN_MM in half-res pixels
+        tip = blob & ((xx - tx) ** 2 + (yy - ty) ** 2 <= r * r)
+        dk = d[tip & ok]
+        if len(dk) < 20:
+            continue
+        ys, xs = np.nonzero(tip)
+        x, y, bw, bh, area = xs.min(), ys.min(), xs.max() - xs.min() + 1, ys.max() - ys.min() + 1, int(tip.sum())
         m = BOX_MARGIN * max(bw, bh)
         box = [int(max(0, x - m) * s), int(max(0, y - m) * s), int(min(w, x + bw + m) * s), int(min(h, y + bh + m) * s)]
         out.append((int(area), float(np.median(dk)), box))
-    return sorted(out, key=lambda c: -c[0])
+    return sorted(out, key=lambda c: -c[0]), near_full
 
 
 def stereo_boxes(images, lefts):
-    """Largest candidate per frame, then re-pick in frames whose tip depth disagrees with the rest."""
-    cands = [tip_candidates(lefts[i], images[i]) for i in tqdm(range(len(images)), desc="  stereo boxes", leave=False)]
+    """Largest candidate per frame, then re-pick in frames whose tip depth disagrees with the rest.
+    Returns the boxes, each frame's near-the-camera map and each frame's stereo time (s)."""
+    res, times = [], []
+    for i in tqdm(range(len(images)), desc="  stereo boxes", leave=False):
+        t0 = time.perf_counter()
+        res.append(tip_candidates(lefts[i], images[i]))
+        times.append(time.perf_counter() - t0)
+    cands, nears = zip(*res)
     first = [c[0] for c in cands if c]
     if not first:
         raise SystemExit("no tool tip found in any frame")
@@ -876,11 +962,12 @@ def stereo_boxes(images, lefts):
         agree = [x for x in c if abs(x[1] / d_med - 1) <= DEPTH_AGREE]
         pick = agree[0] if agree else (c[0] if c else None)
         boxes.append(pick[2] if pick else None)
-    return boxes
+    return boxes, list(nears), times
 
 
-def box_grabcut(img, box) -> np.ndarray:
-    """GrabCut initialised with the box (same S/V/Lab-b features as grabcut_mask); largest blob, holes filled."""
+def box_grabcut(img, box, near) -> np.ndarray:
+    """GrabCut initialised with the box (same S/V/Lab-b features as grabcut_mask), kept to the stereo near
+    region (the tape and bright wood sit on the board and otherwise leak in); largest blob, holes filled."""
     x0, y0, x1, y1 = box
     m = 60
     X0, Y0, X1, Y1 = max(0, x0 - m), max(0, y0 - m), min(img_W, x1 + m), min(img_H, y1 + m)
@@ -890,7 +977,7 @@ def box_grabcut(img, box) -> np.ndarray:
     gc = np.zeros(sub.shape[:2], np.uint8)
     bgd, fgd = np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64)
     cv2.grabCut(feat, gc, (x0 - X0, y0 - Y0, x1 - x0, y1 - y0), bgd, fgd, GC_ITERS, cv2.GC_INIT_WITH_RECT)
-    fg = ((gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD)).astype(np.uint8)
+    fg = ((gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD)).astype(np.uint8) & near[Y0:Y1, X0:X1]
     fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, disk(4))
     fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, disk(8))
     out = np.zeros((img_H, img_W), np.uint8)
@@ -943,9 +1030,25 @@ def render_mask(X, i) -> np.ndarray:
 
 
 # ══ Main: markerless calibration ══════════════════════════════════════════════
-t_start = time.time()
-images = [cv2.imread(f["img_path"]) for f in frames]
 ALL = list(range(N))
+# Train / held-out split by frame order. The calibration pipeline below only ever touches TRAIN frames.
+n_train = min(N - 1, max(3, int(round(args.train_frac * N))))
+TRAIN, TEST = ALL[:n_train], ALL[n_train:]
+startup_s = time.time() - _T_SCRIPT0
+t_start = time.time()
+# Run time of the calibration as it would be done in practice (training frames only). Per image: reading the
+# stereo pair, the stereo tool box, the masks (box GrabCut + the re-seeded GrabCut/ignore zones of every pass).
+# Joint (all images at once): edge LUT, PnP init, DR passes, outlier check + refit.
+rt_img = {i: dict(load_s=0.0, stereo_box_s=0.0, mask_s=0.0) for i in TRAIN}
+rt_joint = dict(edge_lut_s=0.0, pnp_init_s=0.0, dr_passes_s=[], outlier_check_s=0.0, refit_s=0.0)
+images = [None] * N
+lefts = {}
+for i in TRAIN:
+    t0 = time.perf_counter()
+    images[i], lefts[i] = cv2.imread(frames[i]["img_path"]), cv2.imread(frames[i]["left_path"])
+    rt_img[i]["load_s"] = time.perf_counter() - t0
+print(f"Split: fit on frames {[frames[i]['frame_id'] for i in TRAIN]}, "
+      f"held out {[frames[i]['frame_id'] for i in TEST]}")
 stem = f"eval_{DATASET}_markerless_dr_comparison"
 pdf_path = os.path.join(args.eval_dir, stem + ".pdf")
 json_path = os.path.join(args.eval_dir, stem + ".json")
@@ -954,8 +1057,12 @@ if args.reuse_fit:
     # Only the fit's own outputs are taken from the previous run; the reference calibrations are re-read below.
     with open(json_path) as fh:
         prev = json.load(fh)
-    with open(os.path.join(OUT_DIR, "stereo_boxes.json")) as fh:
-        _boxes = json.load(fh)
+    if prev.get("train_frames") != [frames[i]["frame_id"] for i in TRAIN]:
+        raise SystemExit(f"{json_path} was not fit on frames {[frames[i]['frame_id'] for i in TRAIN]} "
+                         f"(it has train_frames={prev.get('train_frames')}) -- rerun without --reuse-fit")
+    # The boxes only feed the debug overlays, which a reused fit does not rewrite -- so they are optional.
+    _bpath = os.path.join(OUT_DIR, "stereo_boxes.json")
+    _boxes = json.load(open(_bpath)) if os.path.exists(_bpath) else {}
     by_id = {f["frame_id"]: i for i, f in enumerate(frames)}
     X_init, X_dr = to_mm(prev["cam_T_base_pnp_init"]), to_mm(prev["cam_T_base_diff_render"])
     USE = [by_id[fid] for fid in prev["tip_found"]]
@@ -964,35 +1071,67 @@ if args.reuse_fit:
     args.mask_passes = prev["mask_passes"]
     masks = None
     fit_runtime = prev.get("fit_runtime_s")
-    print(f"Reusing the diff-render result of {prev['generated']} ({json_path})")
+    runtime = prev.get("runtime")
+    if runtime is None and args.runtime_from:
+        # The reused fit predates run-time logging: take the per-image breakdown from another (timed) run of the
+        # same split, labelled as such on page 1; this fit's own total (fit_runtime_s) is still shown.
+        with open(args.runtime_from) as fh:
+            other = json.load(fh)
+        if other.get("train_frames") != prev["train_frames"] or not other.get("runtime"):
+            raise SystemExit(f"{args.runtime_from} has no run-time log for train_frames={prev['train_frames']}")
+        runtime = dict(other["runtime"], source=dict(path=os.path.abspath(args.runtime_from),
+                                                     generated=other["generated"]))
+    # 'generated' is rewritten by every rebuild; the fit's own date is carried in 'generated_fit'
+    fit_generated = prev.get("generated_fit") or prev["generated"]
+    print(f"Reusing the diff-render result of {fit_generated} ({json_path})")
 else:
+    t0 = time.perf_counter()
     lut = edge_profile_table(frames[0]["K3"])
-    lefts = [cv2.imread(f["left_path"]) for f in frames]
-    boxes = stereo_boxes(images, lefts)
-    for i in ALL:
+    rt_joint["edge_lut_s"] = time.perf_counter() - t0
+    boxes, nears = [None] * N, [None] * N
+    for i, b, nr, ts in zip(TRAIN, *stereo_boxes([images[i] for i in TRAIN], [lefts[i] for i in TRAIN])):
+        boxes[i], nears[i] = b, nr
+        rt_img[i]["stereo_box_s"] = ts
+    for i in TRAIN:
         if boxes[i] is None:
             print(f"  frame {frames[i]['frame_id']}: no tool tip found -- left out")
-    USE = [i for i in ALL if boxes[i] is not None]
+    USE = [i for i in TRAIN if boxes[i] is not None]
     if len(USE) < 3:
-        raise SystemExit("tool tip found in fewer than 3 frames")
-    box_masks = [box_grabcut(images[i], boxes[i]) if boxes[i] is not None else np.zeros((img_H, img_W), np.uint8)
-                 for i in ALL]
+        raise SystemExit("tool tip found in fewer than 3 training frames")
+    box_masks = [None] * N
+    for i in USE:
+        t0 = time.perf_counter()
+        box_masks[i] = box_grabcut(images[i], boxes[i], nears[i])
+        rt_img[i]["mask_s"] += time.perf_counter() - t0
     USE = [i for i in USE if box_masks[i].sum() > 0]
 
+    t0 = time.perf_counter()
     X_init = pnp_init(USE, box_masks)
+    rt_joint["pnp_init_s"] = time.perf_counter() - t0
     X = X_init.copy()
     masks = box_masks
     for pas in range(args.mask_passes):
         if pas > 0:
-            masks = [grabcut_mask(images[i], frames[i], X) * box_region(boxes[i], BOX_CLIP_PX) if i in USE
-                     else box_masks[i] for i in tqdm(ALL, desc="  GrabCut masks", leave=False)]
-        valid = [valid_map(frames[i], X) for i in ALL]
+            masks = [None] * N
+            for i in tqdm(USE, desc="  GrabCut masks", leave=False):
+                t0 = time.perf_counter()
+                masks[i] = grabcut_mask(images[i], frames[i], X) * box_region(boxes[i], BOX_CLIP_PX)
+                rt_img[i]["mask_s"] += time.perf_counter() - t0
+        valid = [None] * N
+        for i in USE:
+            t0 = time.perf_counter()
+            valid[i] = valid_map(frames[i], X)
+            rt_img[i]["mask_s"] += time.perf_counter() - t0
+        t0 = time.perf_counter()
         X_prev, X = X, fit_shared(USE, X, masks, valid, lut, desc=f"pass {pas + 1}/{args.mask_passes}")
+        rt_joint["dr_passes_s"].append(time.perf_counter() - t0)
         dp, rp = calib_change(X_prev, X, USE)
         print(f"Pass {pas + 1}/{args.mask_passes}: moved {dp:.2f} mm / {rp:.2f} deg, mean valid IoU "
               f"{np.mean([iou_valid(i, X, masks, valid) for i in USE]):.3f}")
 
+    t0 = time.perf_counter()
     ious = {i: iou_valid(i, X, masks, valid) for i in USE}
+    rt_joint["outlier_check_s"] = time.perf_counter() - t0
     thr = max(OUTLIER_IOU, float(np.median(list(ious.values()))) - OUTLIER_IOU_DROP)
     inliers = [i for i in USE if ious[i] >= thr]
     if len(inliers) < 3:
@@ -1001,9 +1140,23 @@ else:
     elif len(inliers) < len(USE):
         print(f"Outliers (IoU < {thr:.3f}): {[frames[i]['frame_id'] for i in USE if i not in inliers]} "
               f"-- refitting on {len(inliers)} frames")
+        t0 = time.perf_counter()
         X = fit_shared(inliers, X, masks, valid, lut, desc="inliers")
+        rt_joint["refit_s"] = time.perf_counter() - t0
     X_dr = X
     fit_runtime = time.time() - t_start
+    joint_s = rt_joint["edge_lut_s"] + rt_joint["pnp_init_s"] + sum(rt_joint["dr_passes_s"]) \
+        + rt_joint["outlier_check_s"] + rt_joint["refit_s"]
+    per_img_s = sum(sum(v.values()) for v in rt_img.values())
+    runtime = dict(
+        device=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+        n_images=len(TRAIN), n_images_fit=len(USE),
+        per_image={str(frames[i]["frame_id"]): dict(
+            **rt_img[i], used_in_fit=i in USE,
+            joint_share_s=joint_s / len(USE) if i in USE else 0.0) for i in TRAIN},
+        joint=rt_joint, joint_total_s=joint_s, per_image_total_s=per_img_s,
+        other_s=fit_runtime - joint_s - per_img_s,        # bookkeeping, progress bars, Python overhead
+        total_s=fit_runtime, startup_s=startup_s)
 
 
 # ══ Evaluation (reference calibrations are read only from here on) ════════════
@@ -1014,6 +1167,9 @@ def load_reference_calibrations():
 
 
 X_gt, X_marker = load_reference_calibrations()
+for i in ALL:
+    if images[i] is None:
+        images[i] = cv2.imread(frames[i]["img_path"])
 METHODS = [("hand-eye (marker only)", X_marker), ("diff-render (markerless)", X_dr)]
 
 
@@ -1023,11 +1179,10 @@ def frame_errors(X, i):
     return float(np.linalg.norm(T[:3, 3] - Tg[:3, 3])), rot_deg(T[:3, :3], Tg[:3, :3])
 
 
-EVAL = ALL[:args.eval_frames]
 rows = []
-for i in EVAL:
+for i in TEST:
     r_gt = render_mask(X_gt, i)
-    row = dict(frame_id=frames[i]["frame_id"], inlier=i in inliers, box=boxes[i])
+    row = dict(frame_id=frames[i]["frame_id"])
     for name, Xc in METHODS:
         r = render_mask(Xc, i)
         t_err, r_err = frame_errors(Xc, i)
@@ -1037,14 +1192,52 @@ for i in EVAL:
 
 overall = {}
 for name, Xc in METHODS:
-    d, r = calib_change(X_gt, Xc, ALL)
+    d, r = calib_change(X_gt, Xc, TEST)
     overall[name] = dict(
         mean_clevis_displacement_mm=d, rotation_err_deg=r,
         base_origin_err_mm=float(np.linalg.norm(Xc[:3, 3] - X_gt[:3, 3])),
         eval_mean_trans_err_mm=float(np.mean([row[name]["trans_err_mm"] for row in rows])),
         eval_mean_rot_err_deg=float(np.mean([row[name]["rot_err_deg"] for row in rows])),
         eval_mean_iou_vs_gt=float(np.mean([row[name]["iou_vs_gt"] for row in rows])))
-d0, r0 = calib_change(X_gt, X_init, ALL)
+d0, r0 = calib_change(X_gt, X_init, TEST)
+
+# ── Calibration image: the last training frame, scored with SurgRIPE's metrics (evaluate.py) ─────────────────
+CAL = TRAIN[-1]
+CAL_STATUS = ("used in the fit" if CAL in inliers else
+              "dropped as an outlier" if CAL in USE else "no tool tip found -- not used in the fit")
+SR_MODEL = np.load(os.path.join(args.model_root, "joint.npy")).astype(np.float64)   # what Evaluator loads
+if np.abs(SR_MODEL).max() < 1.0:
+    SR_MODEL = SR_MODEL * 1000.0
+SR_DIAM = float(np.linalg.norm(np.ptp(SR_MODEL, axis=0)))   # = evaluate.py's LND diameter for joint.npy
+
+
+def threshold_curve(values, max_thr, n=401):
+    """Fraction of items with ADD <= threshold over 0..max_thr, and its normalised AUC
+    (as hand_eye_diff_render_test.py's compute_threshold_curve, finer sampling)."""
+    v = np.asarray(values, dtype=float)
+    thr = np.linspace(0.0, max_thr, n)
+    acc = np.array([(v <= t).mean() for t in thr])
+    trapz = getattr(np, "trapezoid", None) or np.trapz
+    return thr, acc, float(trapz(acc, thr) / max_thr)
+
+
+def surgripe_metrics(X, i) -> dict:
+    """evaluate.py's Evaluator on one frame. Its fixed SurgRIPE camera K is replaced by this frame's (the 2D
+    reprojection test would otherwise use another camera); the ADD threshold is 10% of joint.npy's diameter."""
+    ev = Evaluator(root_path=args.model_root, instrument_type="LND", is_save_pose=False)
+    ev.model, ev.diameter, ev.K = SR_MODEL, SR_DIAM, frames[i]["K3"]
+    Tp, Tg = frame_poses_np(X, frames[i])[0], frame_poses_np(X_gt, frames[i])[0]
+    ev.evaluate(pose_gt=Tg[:3], pose_pred=Tp[:3])
+    with contextlib.redirect_stdout(io.StringIO()):
+        out = {k: float(v) for k, v in ev.summarize().items()}
+    out["proj2d_err_px"] = float(np.linalg.norm(sr_project(SR_MODEL, frames[i]["K3"], Tp[:3])
+                                                - sr_project(SR_MODEL, frames[i]["K3"], Tg[:3]), axis=1).mean())
+    out["add_auc_0_diam"] = threshold_curve([out["ADD-distance"]], SR_DIAM)[2]
+    out["iou_vs_gt"] = iou_full(render_mask(X, i), render_mask(X_gt, i))
+    return out
+
+
+cal_metrics = {name: surgripe_metrics(Xc, CAL) for name, Xc in METHODS}
 
 # ── Text summary ──────────────────────────────────────────────────────────────
 lines = []
@@ -1052,7 +1245,10 @@ W_ = 104
 lines.append("=" * W_)
 lines.append("hand_eye_diff_render_comparison.py — markerless hand-eye calibration by differentiable rendering".center(W_))
 lines.append("=" * W_)
-lines.append(f"Dataset   : {ROOT}  ({N} frames; tip found in {len(USE)}, {len(inliers)} kept after outlier rejection)")
+lines.append(f"Dataset   : {ROOT}  ({N} frames)")
+lines.append(f"Fit on    : frames {[frames[i]['frame_id'] for i in TRAIN]} (first {args.train_frac:.0%}; tip found in "
+             f"{len(USE)}, {len(inliers)} kept after outlier rejection)")
+lines.append(f"Held out  : frames {[frames[i]['frame_id'] for i in TEST]} -- never opened by the fit; the only frames scored")
 lines.append(f"Generated : {datetime.datetime.now().isoformat(timespec='seconds')}   fit runtime "
              f"{f'{fit_runtime:.0f}s' if fit_runtime is not None else 'n/a (report rebuilt with --reuse-fit)'}")
 lines.append("Ground truth = marker registration + 3D pose alignment (cam_T_base_post_alignment); used ONLY for scoring.")
@@ -1061,7 +1257,7 @@ lines.append("              No marker calibration, no ground truth, no initial p
 lines.append(f"Pipeline    = stereo tool box -> GrabCut -> PnP init -> {args.mask_passes} DR passes (masks re-seeded from the")
 lines.append("              DR estimate after pass 1) -> outlier rejection + refit.")
 lines.append("")
-lines.append("Whole calibration vs ground truth (all frames):")
+lines.append("Whole calibration vs ground truth (held-out frames):")
 lines.append(f"  {'':<26}{'clevis displ. (mm)':>20}{'rotation (deg)':>16}{'base origin (mm)':>18}")
 lines.append(f"  {'PnP init (no prior)':<26}{d0:>20.2f}{r0:>16.2f}{np.linalg.norm(X_init[:3, 3] - X_gt[:3, 3]):>18.2f}")
 for name, _ in METHODS:
@@ -1069,16 +1265,17 @@ for name, _ in METHODS:
     lines.append(f"  {name:<26}{o['mean_clevis_displacement_mm']:>20.2f}{o['rotation_err_deg']:>16.2f}"
                  f"{o['base_origin_err_mm']:>18.2f}")
 lines.append("")
-lines.append(f"First {len(EVAL)} frames (clevis pose vs its pose under the ground truth; IoU of the rendered silhouettes):")
-hdr = f"  {'frame':>5} {'kept':>4} " + "".join(f"{n[:14] + ' t(mm)':>23}{'rot(deg)':>10}{'IoU':>7}" for n, _ in METHODS)
+lines.append("Held-out frames (calibration applied to each frame's kinematics vs the ground truth applied the same "
+             "way; IoU of the rendered silhouettes):")
+hdr = f"  {'frame':>5} " + "".join(f"{n[:14] + ' t(mm)':>23}{'rot(deg)':>10}{'IoU':>7}" for n, _ in METHODS)
 lines.append(hdr)
 lines.append("  " + "-" * (len(hdr) - 2))
 for row in rows:
-    lines.append(f"  {row['frame_id']:>5} {'y' if row['inlier'] else 'n':>4} " +
+    lines.append(f"  {row['frame_id']:>5} " +
                  "".join(f"{row[n]['trans_err_mm']:>23.2f}{row[n]['rot_err_deg']:>10.2f}{row[n]['iou_vs_gt']:>7.3f}"
                          for n, _ in METHODS))
 lines.append("  " + "-" * (len(hdr) - 2))
-lines.append(f"  {'mean':>5} {'':>4} " + "".join(
+lines.append(f"  {'mean':>5} " + "".join(
     f"{overall[n]['eval_mean_trans_err_mm']:>23.2f}{overall[n]['eval_mean_rot_err_deg']:>10.2f}"
     f"{overall[n]['eval_mean_iou_vs_gt']:>7.3f}" for n, _ in METHODS))
 lines.append("  (t = clevis origin / pitch pin; rotation is the calibration's rotation error, the same for every frame)")
@@ -1130,16 +1327,192 @@ def make_side_by_side(i, X_est, left_label, right_label) -> np.ndarray:
     return np.array(combined)
 
 
+def _style_table(tab, ncols, fs):
+    tab.auto_set_font_size(False); tab.set_fontsize(fs)
+    for c in range(ncols):
+        tab[0, c].set_facecolor("#e8e8e8"); tab[0, c].set_text_props(weight="bold")
+
+
+def error_breakdown(X, i) -> dict:
+    """Where the pose error lies, in the rectified camera frame: along the line of sight to the clevis (depth --
+    the direction a single image constrains least), sideways, and the rotation split into roll about the clevis's
+    long axis (near-symmetric part, hard to see in a silhouette), about the line of sight, and the rest."""
+    Tp, Tg = frame_poses_np(X, frames[i])[0], frame_poses_np(X_gt, frames[i])[0]
+    K3 = frames[i]["K3"]
+    d = Tp[:3, 3] - Tg[:3, 3]
+    view = Tg[:3, 3] / np.linalg.norm(Tg[:3, 3])
+    along = float(d @ view)
+    rv = Rotation.from_matrix(Tp[:3, :3] @ Tg[:3, :3].T).as_rotvec()
+    axis = Tg[:3, 1]                                      # joint_model_pose: y = clevis long axis (-forward)
+    size = lambda T: float(np.ptp(sr_project(SR_MODEL, K3, T[:3]), axis=0).max())
+    return dict(depth_gt_mm=float(Tg[2, 3]), depth_est_mm=float(Tp[2, 3]),
+                trans_along_sight_mm=along, trans_sideways_mm=float(np.linalg.norm(d - along * view)),
+                rot_total_deg=float(np.degrees(np.linalg.norm(rv))),
+                rot_about_clevis_axis_deg=float(np.degrees(abs(rv @ axis))),
+                rot_about_sight_deg=float(np.degrees(abs(rv @ view))),
+                projected_size_gt_px=size(Tg), projected_size_est_px=size(Tp))
+
+
+def outline_crop(i, X_est, pad=110) -> np.ndarray:
+    """Zoom on the tool: ground-truth (green) and estimated (orange) silhouette OUTLINES on the raw image, so a
+    scale (depth) difference is visible -- filled full-frame overlays hide it."""
+    img = cv2.cvtColor(images[i], cv2.COLOR_BGR2RGB).copy()
+    mg, me = render_mask(X_gt, i), render_mask(X_est, i)
+    for m, col in ((mg, (0, 220, 0)), (me, (255, 130, 0))):
+        cs, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        cv2.drawContours(img, cs, -1, col, 3)
+    ys, xs = np.nonzero(mg | me)
+    return img[max(0, ys.min() - pad):ys.max() + pad, max(0, xs.min() - pad):xs.max() + pad]
+
+
+def calibration_frame_pages(pdf):
+    """Front section: diff-render alone, as a 6D pose estimator, on the last training image (2 pages)."""
+    fid = frames[CAL]["frame_id"]
+    DR = METHODS[1][0]
+    m, eb = cal_metrics[DR], cal_breakdown
+    head = (f"{DATASET}: diff-render (markerless) as a 6D pose estimator -- last training frame {fid} "
+            f"({CAL_STATUS})\nscored against the ground-truth pose (marker + 3D pose alignment)")
+
+    # ── Page 1: overlay, zoomed outlines, SurgRIPE metrics, error breakdown ──
+    fig = plt.figure(figsize=(11, 8.5))
+    fig.suptitle(head, fontsize=11, y=0.985)
+    ax = fig.add_axes([0.01, 0.49, 0.98, 0.41])
+    ax.imshow(make_side_by_side(CAL, X_dr, f"GT (marker + 3D alignment)  frame={fid}", DR))
+    ax.set_title(f"{DR}:  translation error {m['trans_error']:.2f} mm   rotation error {m['rot_error']:.2f} deg   "
+                 f"ADD {m['ADD-distance']:.2f} mm   IoU {m['iou_vs_gt']:.3f}", fontsize=10)
+    ax.axis("off")
+
+    ax = fig.add_axes([0.01, 0.07, 0.30, 0.38])
+    ax.imshow(outline_crop(CAL, X_dr)); ax.axis("off")
+    ax.set_title("zoom: outlines  GT (green) vs diff-render (orange)", fontsize=8.5)
+
+    ax = fig.add_axes([0.35, 0.07, 0.27, 0.37]); ax.axis("off")
+    ax.set_title(f"SurgRIPE metrics (evaluate.py), frame {fid}", fontsize=8.5)
+    pf = lambda v: "pass" if v >= 0.5 else "fail"
+    srows = [("ADD (mm)", "ADD-distance", "{:.2f}"),
+             (f"ADD < 10% diam. ({0.1 * SR_DIAM:.2f} mm)", "add", pf),
+             ("ADD-S (mm)", "ADDS-distance", "{:.2f}"),
+             ("ADD-S < 10% diam.", "add-s", pf),
+             ("2D proj. error (px)", "proj2d_err_px", "{:.1f}"),
+             ("2D proj. < 5 px", "proj2d", pf),
+             ("5 mm / 5 deg", "cmd5", pf),
+             ("translation error (mm)", "trans_error", "{:.2f}"),
+             ("rotation error (deg)", "rot_error", "{:.2f}"),
+             ("Avg Acc (0-5 mm)", "avg_acc_0_5mm", "{:.3f}"),
+             ("ADD AUC (0-diam.)", "add_auc_0_diam", "{:.3f}"),
+             ("silhouette IoU vs GT *", "iou_vs_gt", "{:.3f}")]
+    fmt = lambda f, v: f(v) if callable(f) else f.format(v)
+    tab = ax.table(cellText=[[lab, fmt(f, m[k])] for lab, k, f in srows], colLabels=["Metric", "diff-render"],
+                   cellLoc="center", colWidths=[0.62, 0.38], bbox=[0, 0, 1, 1])
+    _style_table(tab, 2, 7)
+    tab[0, 1].set_facecolor("#d9efd9")
+
+    ax = fig.add_axes([0.66, 0.07, 0.33, 0.37]); ax.axis("off")
+    ax.set_title(f"Where the error lies (camera frame), frame {fid}", fontsize=8.5)
+    brows = [("clevis depth: GT / diff-render (mm)", f"{eb['depth_gt_mm']:.1f} / {eb['depth_est_mm']:.1f}"),
+             ("translation along line of sight (mm)", f"{eb['trans_along_sight_mm']:+.2f}"),
+             ("translation sideways (mm)", f"{eb['trans_sideways_mm']:.2f}"),
+             ("rotation, total (deg)", f"{eb['rot_total_deg']:.2f}"),
+             ("  about clevis long axis (roll)", f"{eb['rot_about_clevis_axis_deg']:.2f}"),
+             ("  about line of sight", f"{eb['rot_about_sight_deg']:.2f}"),
+             ("projected clevis size: GT / DR (px)",
+              f"{eb['projected_size_gt_px']:.0f} / {eb['projected_size_est_px']:.0f}"),
+             ("apparent scale DR vs GT", f"{eb['projected_size_est_px'] / eb['projected_size_gt_px']:.2f}x")]
+    tab = ax.table(cellText=[list(r) for r in brows], colLabels=["", "value"], cellLoc="center",
+                   colWidths=[0.68, 0.32], bbox=[0, 0.30, 1, 0.70])
+    _style_table(tab, 2, 7)
+    ax.text(0, 0.0, textwrap.fill(
+        "Negative along-sight = diff-render places the clevis closer to the camera than the ground truth. A depth "
+        "error mostly changes the silhouette's SIZE, which the filled full-frame overlay above hides; the zoomed "
+        "outlines show it. Roll about the clevis's long axis barely changes its near-symmetric silhouette.", 70),
+        fontsize=6.2, va="bottom", transform=ax.transAxes)
+
+    fig.text(0.01, 0.008, textwrap.fill(
+        f"Frame {fid} is the last image the markerless diff-render calibration was fit on; the calibration is applied "
+        "to its kinematics and compared with the ground truth applied the same way (ground truth used only for "
+        "scoring). Metrics: SurgRIPE's evaluate.py Evaluator (ADD / ADD-S pass at 10% of the joint.npy diameter, "
+        "2D projection < 5 px with this frame's rectified K instead of SurgRIPE's fixed K, 5 mm 5 deg, Avg Acc "
+        "0-5 mm as in the SurgRIPE paper's Table 4). * IoU is not a SurgRIPE metric. One image -> pass rates are 0/1.",
+        230), fontsize=6.3, va="bottom")
+    pdf.savefig(fig); plt.close(fig)
+
+    # ── Page 2: ADD threshold curve + run time ──
+    fig = plt.figure(figsize=(11, 8.5))
+    fig.suptitle(head, fontsize=11, y=0.985)
+    add = m["ADD-distance"]
+    x_max = 5.0 * math.ceil(max(SR_DIAM, 1.15 * add) / 5.0)       # round axis end, past both the ADD and diameter
+    ax = fig.add_axes([0.07, 0.18, 0.42, 0.66])
+    thr, acc, _ = threshold_curve([add], x_max, n=2001)
+    ax.plot(thr, acc, color="tab:green", lw=2.2, label=f"diff-render, frame {fid}  (AUC 0-diam. = {m['add_auc_0_diam']:.3f})")
+    for x, t in ((0.1 * SR_DIAM, f"10% diam. = {0.1 * SR_DIAM:.2f} mm (ADD pass)"),
+                 (SR_DIAM, f"diameter = {SR_DIAM:.2f} mm (AUC limit)")):
+        ax.axvline(x, color="0.45", lw=0.9, ls="--")
+        ax.text(x - 0.15, 0.55, t, fontsize=7.5, color="0.35", rotation=90, va="center", ha="right")
+    ax.axvline(add, color="tab:green", lw=0.8, ls=":")
+    ax.annotate(f"ADD = {add:.2f} mm", (add, 0.3), xytext=(add - 0.3, 0.3), fontsize=8, color="tab:green",
+                va="center", ha="right", bbox=dict(fc="white", ec="none", pad=1))
+    ax.set_xlim(0, x_max); ax.set_ylim(-0.02, 1.05)
+    ax.set_xticks(np.arange(0, x_max + 1e-9, 1.0 if x_max <= 20 else 2.0))
+    ax.set_xlabel("ADD threshold (mm)", fontsize=9); ax.set_ylabel("fraction of items with ADD <= threshold", fontsize=9)
+    ax.set_title(f"ADD accuracy vs threshold, frame {fid} (joint.npy, diameter {SR_DIAM:.2f} mm)", fontsize=9.5)
+    ax.tick_params(labelsize=8); ax.grid(alpha=0.3); ax.legend(fontsize=8, loc="upper left")
+    fig.text(0.07, 0.03, textwrap.fill(
+        "A single image is one item, so the curve is a step at that image's ADD: 0 below it, 1 at and above it. "
+        "SurgRIPE's AUC integrates the curve from 0 to the object diameter, so it is 0 whenever ADD exceeds the "
+        "diameter.", 88), fontsize=7.5, va="bottom")
+
+    ax = fig.add_axes([0.55, 0.06, 0.43, 0.80]); ax.axis("off")
+    if runtime is None:
+        ax.set_title("Calibration run time", fontsize=9.5)
+        ax.text(0.5, 0.5, "n/a -- the reused fit predates run-time logging;\nrerun without --reuse-fit",
+                ha="center", va="center", fontsize=9)
+    else:
+        dev = runtime["device"].replace("NVIDIA ", "").replace("GeForce ", "")
+        ax.set_title(f"Calibration run time (s): {runtime['n_images']} training images, {dev}", fontsize=9.5)
+        cells = []
+        for k, v in runtime["per_image"].items():
+            tot = v["load_s"] + v["stereo_box_s"] + v["mask_s"] + v["joint_share_s"]
+            cells.append([k + ("" if v["used_in_fit"] else " (unused)"), f"{v['load_s'] + v['stereo_box_s']:.2f}",
+                          f"{v['mask_s']:.2f}", f"{v['joint_share_s']:.2f}", f"{tot:.2f}"])
+        nimg = len(cells)
+        cells.append(["mean / image"] + [f"{np.mean([float(c[j]) for c in cells]):.2f}" for j in range(1, 5)])
+        borrowed = "source" in runtime
+        cells.append(["TOTAL" + (" (timed)" if borrowed else ""), "", "", "", f"{runtime['total_s']:.1f}"])
+        if borrowed:
+            cells.append(["TOTAL (this fit)", "", "", "",
+                          f"{fit_runtime:.1f}" if fit_runtime is not None else "n/a"])
+        tab = ax.table(cellText=cells, colLabels=["frame", "load +\nstereo box", "masks", "joint DR\nshare",
+                                                  "total /\nimage"], cellLoc="center", bbox=[0, 0.2, 1, 0.8])
+        _style_table(tab, 5, 8)
+        for r in range(nimg + 1, len(cells) + 1):
+            for c in range(5):
+                tab[r, c].set_text_props(weight="bold")
+        j = runtime["joint"]
+        ax.text(0, 0.0, textwrap.fill(
+            f"Joint steps (all {runtime['n_images_fit']} fit images at once, split equally above): edge LUT "
+            f"{j['edge_lut_s']:.1f}, PnP init {j['pnp_init_s']:.2f}, DR passes "
+            f"{' + '.join(f'{x:.1f}' for x in j['dr_passes_s'])}, outlier check {j['outlier_check_s']:.1f}, refit "
+            f"{j['refit_s']:.1f} = {runtime['joint_total_s']:.1f} s. Python overhead {runtime['other_s']:.1f} s is "
+            f"in TOTAL only. One-time start-up (imports, CUDA, mesh, renderer) {runtime['startup_s']:.1f} s "
+            f"extra -> {runtime['total_s'] + runtime['startup_s']:.1f} s from launch."
+            + (f" The fit in this report predates run-time logging (only its total was recorded); the "
+               f"per-image times are from a separate timed fit of the same {runtime['n_images']} images "
+               f"({runtime['source']['generated']})." if borrowed else ""), 95),
+            fontsize=7, va="bottom", transform=ax.transAxes)
+    pdf.savefig(fig); plt.close(fig)
+
+
 def metrics_table_page(pdf):
     fig = plt.figure(figsize=(11, 8.5))
     fig.suptitle(f"{DATASET}: hand-eye (marker only) vs diff-render (markerless), both scored against the ground truth "
                  f"(marker + 3D pose alignment)", fontsize=11, y=0.96)
 
     ax = fig.add_axes([0.04, 0.50, 0.92, 0.38]); ax.axis("off")
-    ax.set_title(f"First {len(rows)} frames", fontsize=10, loc="left")
+    ax.set_title(f"Held-out frames {[r['frame_id'] for r in rows]} (fit on frames "
+                 f"{[frames[i]['frame_id'] for i in TRAIN]}; held-out images never seen by the fit)", fontsize=10, loc="left")
     cols = ["Frame"] + [f"{n.split(' (')[0]}\n{m}" for n, _ in METHODS
                         for m in ("trans. err (mm)", "rot. err (deg)", "IoU")]
-    cells = [[f"{row['frame_id']}{'' if row['inlier'] else ' *'}"] +
+    cells = [[f"{row['frame_id']}"] +
              [f"{row[n][k]:.{p}f}" for n, _ in METHODS
               for k, p in (("trans_err_mm", 2), ("rot_err_deg", 2), ("iou_vs_gt", 3))] for row in rows]
     cells.append(["Mean"] + [f"{overall[n][k]:.{p}f}" for n, _ in METHODS
@@ -1156,7 +1529,7 @@ def metrics_table_page(pdf):
         tab[0, c].set_facecolor("#d9efd9")        # diff-render columns
 
     ax2 = fig.add_axes([0.14, 0.24, 0.72, 0.22]); ax2.axis("off")
-    ax2.set_title(f"Whole calibration, all {N} frames", fontsize=10, loc="left")
+    ax2.set_title("Whole calibration, averaged over the held-out frames", fontsize=10, loc="left")
     cal = [["PnP init (no prior)", f"{d0:.2f}", f"{r0:.2f}", f"{np.linalg.norm(X_init[:3, 3] - X_gt[:3, 3]):.2f}"]]
     cal += [[n, f"{overall[n]['mean_clevis_displacement_mm']:.2f}", f"{overall[n]['rotation_err_deg']:.2f}",
              f"{overall[n]['base_origin_err_mm']:.2f}"] for n, _ in METHODS]
@@ -1170,24 +1543,379 @@ def metrics_table_page(pdf):
         "trans. err = distance between the clevis origin (pitch pin) under the calibration and under the ground truth; "
         "rot. err = geodesic angle between the two clevis orientations (equal to the calibration's rotation error, so "
         "the same in every frame); IoU = overlap of the clevis silhouettes rendered at the calibration and at the "
-        "ground truth. * = frame dropped by the diff-render outlier rejection (still scored). Diff-render inputs: "
+        "ground truth. Each calibration is applied to the held-out frame's kinematics; nothing is fit per frame. "
+        "Diff-render inputs (training frames only): "
         "rectified images, camera/stereo calibration, joint.stl, PSM kinematics -- no ground truth, marker calibration "
         "or initial pose.", 175), fontsize=7.5, va="bottom")
     pdf.savefig(fig); plt.close(fig)
 
 
 if masks is not None:
-    for i in ALL:
+    for i in USE:
         fid = frames[i]["frame_id"]
         cv2.imwrite(os.path.join(OUT_DIR, "masks", f"mask-{fid:04d}.png"), masks[i] * 255)
         o = images[i].copy()
-        if boxes[i] is not None:
-            cv2.rectangle(o, tuple(boxes[i][:2]), tuple(boxes[i][2:]), (0, 0, 255), 3)
+        cv2.rectangle(o, tuple(boxes[i][:2]), tuple(boxes[i][2:]), (0, 0, 255), 3)
         cv2.imwrite(os.path.join(OUT_DIR, "overlays", f"box-{fid:04d}.jpg"), o)
     with open(os.path.join(OUT_DIR, "stereo_boxes.json"), "w") as fh:
         json.dump({str(frames[i]["frame_id"]): boxes[i] for i in ALL}, fh)
 
+# ══ Mask baseline: the generated masks vs a hand-drawn segmentation ══════════════════════════════════════════
+# The final-pass masks the diff-render fit used, scored against a hand segmentation of the clevis with
+# gt_segmentation_eval.py's tools and metrics: its two-panel annotation window (draw on the left, the generated
+# mask on the right), IoU, and the rotation / translation (in-plane, depth) error between the clevis pose best
+# fitting the hand mask and the one best fitting the generated mask (its Nelder-Mead silhouette fit, same stages).
+# The generated masks cover the whole silver tool (clevis + jaws + ring) while the hand masks are the clevis
+# only (gt_segmentation_eval.py's instruction) and the DR loss ignores the jaw / shaft / ring-prong zones -- so
+# the pose fits and the "DR region" IoU use only the pixels the DR loss uses (valid_map at the final estimate);
+# the full-mask IoU is reported too. Runs after the fit, so nothing here can influence the calibration.
+AUTO_MASK_DIR = os.path.join(OUT_DIR, "masks")
+HAND_DIR = args.hand_seg_dir or os.path.join(ROOT, HAND_SEG_SUBDIR)
+_md5 = lambda a: hashlib.md5(np.ascontiguousarray(a).tobytes()).hexdigest()
+_mask_path = lambda fid: os.path.join(AUTO_MASK_DIR, f"mask-{fid:04d}.png")
+
+
+def final_auto_masks():
+    """{frame index: uint8 0/1 mask} of the masks the final fit used, and how they were obtained. A reused fit
+    loads the saved masks if they are that run's (md5s in its JSON); otherwise they are rebuilt with the same steps
+    (stereo box -> GrabCut, then the estimate-seeded GrabCut clipped to the box), seeded from the run's FINAL
+    calibration because the estimate the last pass was seeded from was not saved."""
+    if masks is not None:
+        am = {i: masks[i] for i in USE if masks[i] is not None and masks[i].any()}
+        return am, dict(reconstructed=False, md5={str(frames[i]["frame_id"]): _md5(m) for i, m in am.items()})
+    saved = prev.get("auto_masks")
+    if saved:
+        am = {}
+        for i in USE:
+            p = _mask_path(frames[i]["frame_id"])
+            if os.path.exists(p):
+                am[i] = (cv2.imread(p, cv2.IMREAD_GRAYSCALE) > 127).astype(np.uint8)
+        if am and {str(frames[i]["frame_id"]): _md5(m) for i, m in am.items()} == saved["md5"]:
+            print(f"Mask baseline: using the run's saved masks ({AUTO_MASK_DIR})")
+            return am, saved
+    print("Mask baseline: this run's masks are not on disk -- rebuilding them from its final calibration")
+    bx, nr, _ = stereo_boxes([images[i] for i in TRAIN], [lefts[i] for i in TRAIN])
+    bx, nr = dict(zip(TRAIN, bx)), dict(zip(TRAIN, nr))
+    am = {}
+    for i in tqdm(USE, desc="  rebuild masks", leave=False):
+        if bx[i] is None:
+            continue
+        m = (grabcut_mask(images[i], frames[i], X_dr) * box_region(bx[i], BOX_CLIP_PX) if args.mask_passes > 1
+             else box_grabcut(images[i], bx[i], nr[i]))
+        if m.any():
+            am[i] = m.astype(np.uint8)
+            cv2.imwrite(_mask_path(frames[i]["frame_id"]), am[i] * 255)
+    return am, dict(reconstructed=True,
+                    note=(f"rebuilt {datetime.datetime.now().isoformat(timespec='seconds')}: the run predates saving "
+                          "its masks; same mask steps, last pass seeded from the run's final calibration instead of "
+                          f"its pass-{args.mask_passes - 1} estimate (not saved)"),
+                    md5={str(frames[i]["frame_id"]): _md5(m) for i, m in am.items()})
+
+
+def fit_pose_to_mask_weighted(seg, model, K, mask, weight, T0, window, restarts, rng):
+    """gt_segmentation_eval.fit_pose_to_mask (same stages, simplex, restarts and selection), with both the target
+    and the rendered silhouette multiplied by `weight` so ignored pixels count for neither."""
+    x0, y0, x1, y1 = window
+    scale = min(1.0, seg.FIT_MAX_SIDE_PX / max(x1 - x0, y1 - y0))
+    fw, fh = max(1, int(round((x1 - x0) * scale))), max(1, int(round((y1 - y0) * scale)))
+    Kf, Kfull = seg.window_camera(K, x0, y0, scale), seg.window_camera(K, x0, y0, 1.0)
+    rs = lambda a: cv2.resize(a[y0:y1, x0:x1].astype(np.float32), (fw, fh), interpolation=cv2.INTER_AREA)
+    target, wgt = rs(mask), rs(weight)
+    w_full = weight[y0:y1, x0:x1] > 0.5
+    m_full = mask[y0:y1, x0:x1] > 0
+    pivot = model.posed(T0)[0].mean(axis=0)
+
+    def render_fit(x, cell_mm):
+        return seg.render_silhouette(model, seg.delta_from_params(x, pivot) @ T0, Kf, (fw, fh), cell_mm,
+                                     seg.FIT_SUPERSAMPLE).astype(np.float32) / 255.0
+
+    starts = [np.zeros(6)]
+    t_rng, r_rng = seg.FIT_RESTART_RANGE
+    for _ in range(max(0, restarts - 1)):
+        starts.append(np.concatenate([rng.uniform(-t_rng, t_rng, 3), rng.uniform(-r_rng, r_rng, 3)]))
+    best_iou, best_pose = -1.0, T0
+    for start in starts:
+        x = start
+        for cell_mm, sigma, (t_step, r_step), max_evals in seg.FIT_STAGES:
+            tb = cv2.GaussianBlur(target, (0, 0), sigma) * wgt
+            simplex = np.vstack([x] + [x + np.eye(6)[k] * (t_step if k < 3 else r_step) for k in range(6)])
+            x = seg.minimize(
+                lambda p: 1.0 - seg.soft_iou(cv2.GaussianBlur(render_fit(p, cell_mm), (0, 0), sigma) * wgt, tb),
+                x, method="Nelder-Mead",
+                options={"initial_simplex": simplex, "maxfev": max_evals, "xatol": 0.01, "fatol": 1e-5}).x
+        pose = seg.delta_from_params(x, pivot) @ T0
+        r = seg.render_silhouette(model, pose, Kfull, (x1 - x0, y1 - y0)) > 127
+        score = seg.iou(r & w_full, m_full & w_full)
+        if score > best_iou:
+            best_iou, best_pose = score, pose
+    return best_pose
+
+
+def run_mask_baseline():
+    import sys
+    sys.path.insert(0, os.path.expanduser(args.seg_tools))
+    import gt_segmentation_eval as seg
+    os.makedirs(AUTO_MASK_DIR, exist_ok=True)
+    auto, auto_info = final_auto_masks()
+    if not auto:
+        print("Mask baseline: no generated masks -- skipped")
+        return None, auto_info, {}
+    model = seg.ClevisModel(os.path.join(args.model_root, "joint.stl"))
+    by_fid = {frames[i]["frame_id"]: i for i in auto}
+    cand = sorted(auto)
+    pick = cand if not 0 < args.seg_frames < len(cand) else \
+        [cand[k] for k in np.unique(np.round(np.linspace(0, len(cand) - 1, args.seg_frames)).astype(int))]
+    recs = [dict(frame_index=frames[i]["frame_id"], right_rect_image=os.path.abspath(frames[i]["img_path"]))
+            for i in pick]
+    os.makedirs(HAND_DIR, exist_ok=True)
+    ann = seg.load_annotations(HAND_DIR)
+    status = lambda r: ann["frames"].get(str(r["frame_index"]), {}).get("status", "pending")
+    pending = [r["frame_index"] for r in recs if status(r) not in ("saved", "skipped")]
+    if pending and not args.no_annotate:
+        if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            print(f"Mask baseline: frames {pending} have no hand segmentation and there is no display -- "
+                  f"rerun on a desktop (or with --reuse-fit) to draw them")
+        else:
+            print(f"Mask baseline: hand-segment the clevis in frames {pending} (left panel); the right panel shows "
+                  f"the generated mask. Saved to {HAND_DIR}")
+            seg.save_annotations(HAND_DIR, ann)
+            label = "Generated mask (diff-render pipeline, final pass)" + \
+                    (" -- rebuilt" if auto_info.get("reconstructed") else "")
+            seg.Annotator(HAND_DIR, recs, ann, model,
+                          reference=lambda r: (auto[by_fid[r["frame_index"]]], label)).run()
+            ann = seg.load_annotations(HAND_DIR)
+    done = [r for r in recs if status(r) == "saved"]
+    if not done:
+        print("Mask baseline: no hand-segmented frames yet -- not in the report")
+        return None, auto_info, {}
+
+    old = {r["frame_id"]: r for r in ((prev.get("mask_baseline") or {}).get("frames", []) if args.reuse_fit else [])}
+    results, panels = [], {}
+    for n, r in enumerate(done):
+        fid = r["frame_index"]; i = by_fid[fid]; f = frames[i]
+        hand = cv2.imread(os.path.join(HAND_DIR, ann["frames"][str(fid)]["mask"]), cv2.IMREAD_GRAYSCALE) > 127
+        a = auto[i] > 0
+        valid = valid_map(f, X_dr)
+        v = valid > 0.5
+        key = "|".join([_md5(hand), _md5(a), _md5(v), str(args.seg_fit_restarts), str(args.seg_seed)])
+        t0 = time.time()
+        if fid in old and old[fid].get("key") == key:
+            res = old[fid]
+        else:
+            T_dr, T_gt = (to_m(frame_poses_np(X, f)[0]) for X in (X_dr, X_gt))
+            win = seg.crop_window([a, hand], (img_W, img_H), margin_frac=0.5)
+            fits = {}
+            for name, m in (("hand", hand), ("auto", a)):
+                fits[name] = fit_pose_to_mask_weighted(seg, model, f["K3"], m, valid, T_dr, win,
+                                                       args.seg_fit_restarts,
+                                                       np.random.default_rng(args.seg_seed + fid))
+            res = dict(frame_id=fid, key=key, iou=seg.iou(a, hand), iou_dr_region=seg.iou(a & v, hand & v),
+                       **seg.pose_error(fits["hand"], fits["auto"]),
+                       hand_fit_vs_gt=seg.pose_error(T_gt, fits["hand"]),
+                       hand_fit_vs_diff_render=seg.pose_error(T_dr, fits["hand"]),
+                       pose_hand_fit=fits["hand"].tolist(), pose_auto_fit=fits["auto"].tolist())
+        results.append(res)
+        fm = {k: seg.render_silhouette(model, np.array(res[f"pose_{k}_fit"]), f["K3"], (img_W, img_H)) > 127
+              for k in ("hand", "auto")}
+        x0, y0, x1, y1 = seg.crop_window([hand, a, fm["hand"], fm["auto"]], (img_W, img_H))
+        c = (slice(y0, y1), slice(x0, x1))
+        rgb = cv2.cvtColor(images[i], cv2.COLOR_BGR2RGB)[c]
+        p_iou = seg.iou_panel(rgb, hand[c], a[c])
+        p_iou[~v[c]] = (0.35 * p_iou[~v[c]]).astype(np.uint8)          # ignored by the DR loss: darkened
+        p_out = seg.outline_panel(rgb, [(a[c], (255, 0, 0), 2), (fm["auto"][c], (255, 0, 255), 2),
+                                        (fm["hand"][c], (0, 255, 255), 2), (hand[c], (0, 200, 0), 1)])
+        panels[fid] = (p_iou, p_out)
+        print(f"  [{n + 1}/{len(done)}] frame {fid}: IoU {res['iou']:.3f} (DR region {res['iou_dr_region']:.3f})  "
+              f"rot {res['rot_err_deg']:.2f} deg  trans {res['trans_err_mm']:.2f} mm (in-plane "
+              f"{res['trans_err_inplane_mm']:.2f}, depth {res['trans_err_depth_mm']:.2f})  ({time.time() - t0:.0f}s)")
+    meta = dict(hand_segmentation_dir=HAND_DIR, auto_mask_dir=AUTO_MASK_DIR, n_candidates=len(cand),
+                fit_restarts=args.seg_fit_restarts,
+                seed=args.seg_seed, start_pose="diff-render estimate", frames=results,
+                skipped=[r["frame_index"] for r in recs if status(r) == "skipped"],
+                pending=[r["frame_index"] for r in recs if status(r) == "pending"])
+    return meta, auto_info, panels
+
+
+def _stats_rows(results, cols):
+    rows = [[str(r["frame_id"])] + [f"{g(r):.3f}" for _, g in cols] for r in results]
+    for name, fn in (("mean", np.mean), ("median", np.median), ("std", np.std), ("max", np.max)):
+        rows.append([name] + [f"{fn([g(r) for r in results]):.3f}" for _, g in cols])
+    return rows
+
+
+def _table(ax, rows, labels, fs=8):
+    tab = ax.table(cellText=rows, colLabels=labels, cellLoc="center", bbox=[0, 0, 1, 1])
+    _style_table(tab, len(labels), fs)
+    for k, row in enumerate(rows, start=1):
+        if not row[0].isdigit():
+            for j in range(len(row)):
+                tab[k, j].set_facecolor("#e8e8e8"); tab[k, j].set_text_props(weight="bold")
+
+
+def mask_baseline_pages(pdf):
+    from matplotlib.patches import Patch
+    res = mask_baseline["frames"]
+    src = ("REBUILT -- " + auto_mask_info["note"]) if auto_mask_info.get("reconstructed") else \
+        "saved by the fit itself (final pass)"
+    fig = plt.figure(figsize=(11, 8.5))
+    fig.suptitle(f"{DATASET}: mask baseline -- diff-render's generated masks vs hand-drawn clevis segmentation "
+                 f"(gt_segmentation_eval.py metrics)", fontsize=11, y=0.975)
+    fig.text(0.04, 0.915, "\n".join(textwrap.wrap(
+        f"Generated masks: the masks of the diff-render fit in this report ({len(res)} training frames with a hand "
+        f"mask), {src}. Hand masks: {HAND_DIR} (clevis only, drawn in gt_segmentation_eval.py's window). "
+        "IoU = generated vs hand mask over the whole image; 'DR region' = only the pixels the diff-render loss "
+        "uses (jaw / shaft / ring-prong zones excluded, as in the fit). Pose errors: clevis pose best fitting the "
+        "generated mask vs best fitting the hand mask (gt_segmentation_eval.py's Nelder-Mead silhouette fit, "
+        f"{mask_baseline['fit_restarts']} starts from the diff-render estimate, DR region only), camera frame at "
+        "the pitch pin; depth = camera z, weakly observable from a silhouette.", 190)), fontsize=7.3, va="top")
+    ax = fig.add_axes([0.04, 0.05, 0.92, 0.72]); ax.axis("off")
+    cols = [("IoU", lambda r: r["iou"]), ("IoU\n(DR region)", lambda r: r["iou_dr_region"]),
+            ("rot err\n(deg)", lambda r: r["rot_err_deg"]), ("trans err\n(mm)", lambda r: r["trans_err_mm"]),
+            ("in-plane\n(mm)", lambda r: r["trans_err_inplane_mm"]), ("depth\n(mm)", lambda r: r["trans_err_depth_mm"])]
+    _table(ax, _stats_rows(res, cols), ["frame"] + [c for c, _ in cols])
+    if mask_baseline["skipped"] or mask_baseline["pending"]:
+        fig.text(0.04, 0.015, f"Not scored: skipped (clevis hidden) {mask_baseline['skipped']}, not yet drawn "
+                 f"{mask_baseline['pending']}.", fontsize=7.5)
+    pdf.savefig(fig); plt.close(fig)
+
+    fig = plt.figure(figsize=(11, 8.5))
+    fig.suptitle(f"{DATASET}: mask baseline -- what the hand segmentation says about the poses", fontsize=11, y=0.975)
+    fig.text(0.04, 0.915, "\n".join(textwrap.wrap(
+        "Context, not a mask metric: the clevis pose best fitting the HAND mask (an image-only reference, as "
+        "gt_segmentation_eval.py uses it) compared with the ground-truth pose and with the diff-render pose of "
+        "each frame. Same fit and error definitions as the previous page.", 190)), fontsize=7.3, va="top")
+    ax = fig.add_axes([0.04, 0.05, 0.92, 0.77]); ax.axis("off")
+    cols = []
+    for key, lab in (("hand_fit_vs_gt", "vs GT"), ("hand_fit_vs_diff_render", "vs DR")):
+        cols += [(f"{lab}\nrot (deg)", lambda r, k=key: r[k]["rot_err_deg"]),
+                 (f"{lab}\ntrans (mm)", lambda r, k=key: r[k]["trans_err_mm"]),
+                 (f"{lab}\nin-plane (mm)", lambda r, k=key: r[k]["trans_err_inplane_mm"]),
+                 (f"{lab}\ndepth (mm)", lambda r, k=key: r[k]["trans_err_depth_mm"])]
+    _table(ax, _stats_rows(res, cols), ["frame"] + [c for c, _ in cols])
+    pdf.savefig(fig); plt.close(fig)
+
+    for r in res:
+        p_iou, p_out = mask_baseline_panels[r["frame_id"]]
+        fig, axes = plt.subplots(1, 2, figsize=(11, 8.5))
+        dx, dy, dz = r["dxyz_mm"]
+        fig.suptitle(f"mask baseline, frame {r['frame_id']}{' (generated mask rebuilt)' if auto_mask_info.get('reconstructed') else ''}"
+                     f":  IoU {r['iou']:.3f}  (DR region {r['iou_dr_region']:.3f})\nfit to generated vs fit to hand "
+                     f"mask: rot {r['rot_err_deg']:.2f} deg   trans {r['trans_err_mm']:.2f} mm (x {dx:+.2f}, "
+                     f"y {dy:+.2f}, z {dz:+.2f}; in-plane {r['trans_err_inplane_mm']:.2f})", fontsize=10)
+        axes[0].imshow(p_iou)
+        axes[0].set_title("IoU: generated mask over the hand mask (darkened = ignored by the DR loss)", fontsize=8.5)
+        axes[0].legend(handles=[Patch(color=(1, 0.86, 0), label="overlap"),
+                                Patch(color=(1, 0, 0), label="generated only"),
+                                Patch(color=(0, 0.78, 0), label="hand only")], loc="lower right", fontsize=7)
+        axes[1].imshow(p_out)
+        axes[1].set_title("outlines: masks and the clevis poses best fitting each", fontsize=8.5)
+        axes[1].legend(handles=[Patch(color=(1, 0, 0), label="generated mask"),
+                                Patch(color=(1, 0, 1), label="fit to generated"),
+                                Patch(color=(0, 1, 1), label="fit to hand"),
+                                Patch(color=(0, 0.78, 0), label="hand mask")], loc="lower right", fontsize=7)
+        for ax in axes:
+            ax.axis("off")
+        fig.tight_layout(rect=(0, 0, 1, 0.92))
+        pdf.savefig(fig); plt.close(fig)
+
+
+mask_baseline, auto_mask_info, mask_baseline_panels = (None, None, {}) if args.no_mask_baseline \
+    else run_mask_baseline()
+
+
+def write_mask_vs_segmentation_pdf(pdf_path):
+    """Standalone report in gt_segmentation_eval.py's segmentation_eval.pdf format (its write_pdf layout: portrait,
+    bold title, monospace meta block, frame table with mean / median / std / max rows, then one page per frame with
+    the IoU panel above the outline panel) -- here generated mask vs hand mask instead of GT vs hand mask."""
+    from matplotlib.patches import Patch
+    res = mask_baseline["frames"]
+    meta_lines = [
+        f"dataset:       {os.path.abspath(ROOT)}",
+        f"evaluated:     {time.ctime()}",
+        "generated:     diff-render pipeline final-pass masks"
+        + (" -- REBUILT (the run predates saving its masks)" if auto_mask_info.get("reconstructed") else ""),
+        f"               fit of {fit_generated if args.reuse_fit else 'this run'}"
+        + (f"; same mask steps, last pass seeded from its final calibration (its pass-{args.mask_passes - 1}"
+           if auto_mask_info.get("reconstructed") else ""),
+    ] + (["               estimate was not saved)"] if auto_mask_info.get("reconstructed") else []) + [
+        f"               {AUTO_MASK_DIR}",
+        f"hand masks:    {HAND_DIR} (clevis only)",
+        f"frames:        {[r['frame_id'] for r in res]} ({len(res)} of the {mask_baseline['n_candidates']} "
+        f"training frames, evenly spaced)",
+        f"model:         {os.path.join(args.model_root, 'joint.stl')} (clevis only)",
+        "IoU:           generated mask vs drawn mask, whole image; 'DR rgn' = only the pixels the diff-render",
+        "               loss uses (jaw / shaft / ring-prong zones excluded -- the generated mask covers them)",
+        "errors:        pose best fitting the generated mask vs pose best fitting the drawn mask (camera frame,",
+        f"               at the pitch pin; gt_segmentation_eval.py's fit, {mask_baseline['fit_restarts']} starts, "
+        "DR region only);",
+        "               depth = camera z, only weakly observable from a silhouette",
+    ]
+    keys = [("iou", "IoU"), ("iou_dr_region", "IoU (DR rgn)"), ("rot_err_deg", "rot err [deg]"),
+            ("trans_err_mm", "trans err [mm]"), ("trans_err_inplane_mm", "in-plane [mm]"),
+            ("trans_err_depth_mm", "depth [mm]")]
+    rows = [[str(r["frame_id"])] + [f"{r[k]:.3f}" for k, _ in keys] for r in res]
+    for name, fn in (("mean", np.mean), ("median", np.median), ("std", np.std), ("max", np.max)):
+        rows.append([name] + [f"{fn([r[k] for r in res]):.3f}" for k, _ in keys])
+
+    with PdfPages(pdf_path) as pdf:
+        per_page = 30
+        for start in range(0, len(rows), per_page):
+            fig = plt.figure(figsize=(8.5, 11))
+            fig.text(0.06, 0.96, "Generated masks vs hand segmentation", fontsize=15, weight="bold")
+            fig.text(0.06, 0.94 - 0.016 * len(meta_lines), "\n".join(meta_lines), fontsize=7.5, va="bottom",
+                     family="monospace")
+            ax = fig.add_axes([0.06, 0.06, 0.88, 0.80 - 0.016 * len(meta_lines)])
+            ax.axis("off")
+            chunk = rows[start:start + per_page]
+            table = ax.table(cellText=chunk, colLabels=["frame"] + [label for _, label in keys],
+                             loc="upper center", cellLoc="center")
+            table.auto_set_font_size(False)
+            table.set_fontsize(8.5)
+            table.scale(1, 1.3)
+            for i, row in enumerate(chunk, start=1):
+                if not row[0].isdigit():
+                    for j in range(len(row)):
+                        table[i, j].set_facecolor("#e8e8e8")
+            pdf.savefig(fig)
+            plt.close(fig)
+
+        for r in res:
+            panel_iou, panel_err = mask_baseline_panels[r["frame_id"]]
+            fig, axes = plt.subplots(2, 1, figsize=(8.5, 11))
+            dx, dy, dz = r["dxyz_mm"]
+            fig.suptitle(f"frame {r['frame_id']}  ({os.path.basename(frames[mask_frame_idx[r['frame_id']]]['img_path'])})"
+                         f"   IoU {r['iou']:.3f}  (DR region {r['iou_dr_region']:.3f})"
+                         f"\nrot err {r['rot_err_deg']:.2f} deg   trans err {r['trans_err_mm']:.2f} mm "
+                         f"(x {dx:+.2f}, y {dy:+.2f}, z {dz:+.2f} mm; in-plane {r['trans_err_inplane_mm']:.2f})",
+                         fontsize=10)
+            axes[0].imshow(panel_iou)
+            axes[0].set_title("IoU: generated mask over the segmentation (darkened = ignored by the DR loss)",
+                              fontsize=9)
+            axes[0].legend(handles=[Patch(color=(1, 0.86, 0), label="overlap (generated and drawn)"),
+                                    Patch(color=(1, 0, 0), label="generated only"),
+                                    Patch(color=(0, 0.78, 0), label="drawn only")], loc="lower right", fontsize=7)
+            axes[1].imshow(panel_err)
+            axes[1].set_title("Errors: pose best fitting the generated mask vs pose best fitting the segmentation",
+                              fontsize=9)
+            axes[1].legend(handles=[Patch(color=(1, 0, 0), label="generated mask"),
+                                    Patch(color=(1, 0, 1), label="fit to generated"),
+                                    Patch(color=(0, 1, 1), label="fit to drawn"),
+                                    Patch(color=(0, 0.78, 0), label="drawn")], loc="lower right", fontsize=7)
+            for ax in axes:
+                ax.axis("off")
+            fig.tight_layout(rect=(0, 0, 1, 0.95))
+            pdf.savefig(fig)
+            plt.close(fig)
+    print(f"Mask vs segmentation report → {pdf_path}")
+
+
+if mask_baseline:
+    mask_frame_idx = {frames[i]["frame_id"]: i for i in ALL}
+    write_mask_vs_segmentation_pdf(os.path.join(args.eval_dir, SEG_PDF_NAME))
+
+cal_breakdown = error_breakdown(X_dr, CAL)
 with PdfPages(pdf_path) as pdf:
+    calibration_frame_pages(pdf)
     metrics_table_page(pdf)
     fig = plt.figure(figsize=(11, 8.5))
     fig.text(0.02, 0.98, "\n".join(lines), family="monospace", fontsize=6.6, va="top", ha="left")
@@ -1201,24 +1929,29 @@ with PdfPages(pdf_path) as pdf:
             ax.set_title(f"{name}:  translation error {m['trans_err_mm']:.2f} mm   rotation error "
                          f"{m['rot_err_deg']:.2f} deg   IoU {m['iou_vs_gt']:.3f}", fontsize=10)
             ax.axis("off")
-        fig.suptitle(f"frame_{row['frame_id']}" + ("" if row["inlier"] else "   (dropped by the diff-render outlier "
-                                                    "rejection; still scored)"), fontsize=11)
+        fig.suptitle(f"frame_{row['frame_id']}   (held out: not used by the diff-render fit)", fontsize=11)
         fig.tight_layout(rect=(0, 0, 1, 0.96))
         pdf.savefig(fig); plt.close(fig)
+    if mask_baseline:
+        mask_baseline_pages(pdf)
 
 result = dict(
     generated=datetime.datetime.now().isoformat(timespec="seconds"), dataset=os.path.abspath(ROOT),
     dr_inputs=["right_rect + left_rect images", "camera_matrix_right_rect", "rect_T_cam_raw",
                "stereo_rectification P matrices", "joint.stl", "base_T_gripper", "base_T_shaft_end"],
-    frames=[f["frame_id"] for f in frames], tip_found=[frames[i]["frame_id"] for i in USE],
+    frames=[f["frame_id"] for f in frames], train_frames=[frames[i]["frame_id"] for i in TRAIN],
+    test_frames=[frames[i]["frame_id"] for i in TEST], tip_found=[frames[i]["frame_id"] for i in USE],
     inliers=[frames[i]["frame_id"] for i in inliers], mask_passes=args.mask_passes, fit_runtime_s=fit_runtime,
     cam_T_base_ground_truth=to_m(X_gt).tolist(), cam_T_base_marker_only=to_m(X_marker).tolist(),
     cam_T_base_pnp_init=to_m(X_init).tolist(), cam_T_base_diff_render=to_m(X_dr).tolist(),
-    pnp_init_vs_gt=dict(mean_clevis_displacement_mm=d0, rotation_err_deg=r0),
-    overall=overall, eval_frames=rows,
+    pnp_init_vs_gt_on_test=dict(mean_clevis_displacement_mm=d0, rotation_err_deg=r0),
+    overall_on_test=overall, test_frame_results=rows,
+    calibration_frame=dict(frame_id=frames[CAL]["frame_id"], status=CAL_STATUS, model_diameter_mm=SR_DIAM,
+                           surgripe_metrics=cal_metrics, error_breakdown_diff_render=cal_breakdown),
+    runtime=runtime, auto_masks=auto_mask_info, mask_baseline=mask_baseline,
 )
 if args.reuse_fit:
-    result["generated_fit"] = prev["generated"]
+    result["generated_fit"] = fit_generated
 with open(json_path, "w") as fh:
     json.dump(result, fh, indent=2)
 print(f"Report → {pdf_path}\nResult → {json_path}")
